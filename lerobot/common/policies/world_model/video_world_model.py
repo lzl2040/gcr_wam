@@ -1,0 +1,802 @@
+import torch.nn as nn
+import torch
+from torch import Tensor, nn
+from diffusers import (
+    AutoencoderKLWan,
+    DPMSolverMultistepScheduler,
+    SanaVideoPipeline,
+    FlowMatchEulerDiscreteScheduler,
+    SanaVideoTransformer3DModel,
+)
+from typing import Any, Dict, Optional, Tuple, Union
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from lerobot.common.policies.world_model.modified_sana_transformer import Modified_SanaVideoTransformerBlock, Modified_SanaVideoTransformerBlock_V2, Modified_SanaModulatedNorm, Modified_WanRotaryPosEmbed, AdaLNTime
+from lerobot.common.utils.utils import get_safe_dtype
+import math
+import torch.nn.functional as F  # noqa: N812
+from diffusers.video_processor import VideoProcessor
+import imageio.v2 as imageio
+import numpy as np
+import time
+
+def create_sinusoidal_pos_embedding(
+    time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+) -> Tensor:
+    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    if dimension % 2 != 0:
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
+
+    if time.ndim != 1:
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+
+    # Compute the outer product
+    scaling_factor = 1.0 / period * 2 * math.pi
+    sin_input = scaling_factor[None, :] * time[:, None]
+    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    return pos_emb
+
+
+def get_sigmas(noise_scheduler, timesteps, n_dim=4, dtype=torch.float32, device = "cuda"):
+    sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
+    schedule_timesteps = noise_scheduler.timesteps.to(device)
+    timesteps = timesteps.to(device)
+    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+    sigma = sigmas[step_indices].flatten()
+    while len(sigma.shape) < n_dim:
+        sigma = sigma.unsqueeze(-1)
+    return sigma
+
+def sample_beta(alpha, beta, bsize, device):
+    gamma1 = torch.empty((bsize,), device=device).uniform_(0, 1).pow(1 / alpha)
+    gamma2 = torch.empty((bsize,), device=device).uniform_(0, 1).pow(1 / beta)
+    return gamma1 / (gamma1 + gamma2)
+
+
+def prepare_encoder_attention_mask_text_condition(
+    N_V: int,
+    N_A: int,
+    M_L: int, 
+    M_LS: int,
+    M_LM: int,
+    M_H: int = 0,
+    *,
+    batch_size: int | None = None,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+    is_video_pad: bool = False,
+    lan_mask = None
+):
+    """
+    Build cross-attention mask for:
+    Target: [Video | Action]
+    Source: [History Video | Latent Scene | Latent Motion]
+
+    Rules:
+    - Video queries attend to History Video + Latent Scene
+    - Action queries attend to Latent Motion only
+
+    Returns:
+    attn_mask:
+        shape = (Q_len, K_len)                if batch_size is None
+            or (B, Q_len, K_len)             if batch_size is not None
+        values = 0 (allowed) or -inf (masked)
+    """
+    Q_len = N_V + N_A
+    # K_len = N_V + N_A + M_L + M_LS + M_LM
+    K_len = M_L + M_LS + M_LM
+
+    # initialize all masked
+    attn_mask = torch.full(
+        (Q_len, K_len),
+        float("-inf"),
+        device=device,
+        dtype=dtype,
+    )
+    Q_len = 0
+
+    # ----- Video queries -----
+    video_q = slice(0, N_V)
+    
+    # key
+    # video_k = slice(0, N_V)
+    # action_k = slice(N_V, N_V + N_A)
+    # M_H = 0
+    # history_k = slice(Q_len, Q_len + M_H)
+    # lan_k = slice(Q_len + M_H, Q_len + M_H + M_L)
+    lan_k = slice(Q_len, Q_len + M_L)
+    scene_k = slice(Q_len + M_L, Q_len + M_LS + M_L)
+    motion_k = slice(Q_len + M_LS + M_L, Q_len + M_LS + M_LM + M_L)
+
+    # print(f"Lan:{lan_k}")
+    # attn_mask[video_q, video_k] = 0.0
+    # attn_mask[video_q, action_k] = 0.0 # add 0 make nan
+    # attn_mask[video_q, action_k] = -10000.0
+    # attn_mask[video_q, history_k] = 0.0
+    attn_mask[video_q, lan_k] = 0.0
+    attn_mask[video_q, scene_k] = 0.0
+    attn_mask[video_q, motion_k] = 0.0
+
+    # ----- Action queries -----
+    action_q = slice(N_V, N_V + N_A)
+    
+    
+    # attn_mask[action_q, video_k] = 0.0
+    # if is_video_pad:
+    #     attn_mask[action_q, video_k] = float("-inf")
+    attn_mask[action_q, lan_k] = 0.0
+    attn_mask[action_q, scene_k] = 0.0
+    attn_mask[action_q, motion_k] = 0.0
+
+    if batch_size is not None:
+        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
+
+    if lan_mask is not None:
+        # print(lan_mask)
+        # lan_mask: (B, M_L) -> (B, 1, M_L)
+        lan_pad = torch.zeros(
+            (lan_mask.shape[0], 1, lan_mask.shape[1]),
+            device=device,
+            dtype=dtype
+        )
+
+        lan_pad = lan_pad.masked_fill(
+            lan_mask.eq(0).unsqueeze(1),
+            float("-inf")
+        )
+
+        # language key 在 K 里的位置
+        lan_k = slice(Q_len, Q_len + M_L)
+
+        # broadcast 到所有 query
+        attn_mask[:, :, lan_k] = attn_mask[:, :, lan_k] + lan_pad
+    
+    return attn_mask
+
+def prepare_encoder_physical_attention_mask(
+    N_V: int,
+    N_A: int,
+    M_LS: int,
+    M_LM: int,
+    M_L: int, 
+    *,
+    T_V: int,
+    batch_size: int | None = None,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+    is_video_pad: bool = False,
+):
+    """
+    Target (Q): [Video | Action]
+    Source (K): [Video | Action | Latent Scene | Latent Motion]
+
+    Time rules:
+    - Video sees: history video + future action
+    - Action sees: history action + future video
+    """
+    T = N_A
+    assert N_A == T
+    HW = N_V // T_V
+    # print(T, T_V)
+
+    Q_len = N_V + N_A
+    K_len = N_V + N_A + M_L + M_LS + M_LM
+
+    attn_mask = torch.full(
+        (Q_len, K_len),
+        float("-inf"),
+        device=device,
+        dtype=dtype,
+    )
+
+    # --------------------------------------------------
+    # slices
+    # --------------------------------------------------
+    video_q  = slice(0, N_V)
+    action_q = slice(N_V, N_V + N_A)
+
+    video_k  = slice(0, N_V)
+    action_k = slice(N_V, N_V + N_A)
+    lan_k    = slice(N_V + N_A, N_V + N_A + M_L)
+
+    scene_k  = slice(Q_len + M_L, Q_len + M_L + M_LS)
+    motion_k = slice(Q_len + M_L + M_LS, Q_len + M_L + M_LS + M_LM)
+
+    # ==================================================
+    # 1. Video → Video (history only, causal in tau)
+    # ==================================================
+    for tau_q in range(T_V):
+        q_start = tau_q * HW
+        q_end   = q_start + HW
+
+        k_end = (tau_q + 1) * HW
+        attn_mask[q_start:q_end, video_k.start : k_end] = 0.0
+
+    # ==================================================
+    # 2. Action → Action (history only)
+    # ==================================================
+    for t_q in range(T):
+        attn_mask[
+            N_V + t_q,
+            N_V : N_V + t_q + 1
+        ] = 0.0
+
+    # ==================================================
+    # 3. Action → Video (future video)
+    #    tau >= floor(t / r)
+    # ==================================================
+    for t_q in range(T):
+        tau_min = (t_q * T_V) // T
+        v_start = tau_min * HW
+        attn_mask[
+            N_V + t_q,
+            v_start : N_V
+        ] = 0.0
+
+    # ==================================================
+    # 4. Video → Action (current action + future)
+    #    t >= (tau + 1) * r
+    # ==================================================
+    for tau_q in range(T_V):
+        q_start = tau_q * HW
+        q_end   = q_start + HW
+
+        t_min = (tau_q * T) // T_V
+        if t_min < T:
+            attn_mask[
+                q_start:q_end,
+                N_V + t_min : N_V + T
+            ] = 0.0
+
+    # ==================================================
+    # 5. Extra conditions（保持你原来的语义）
+    # ==================================================
+    # Video queries
+    attn_mask[video_q, lan_k] = 0.0
+    attn_mask[video_q, scene_k]  = 0.0
+    attn_mask[video_q, motion_k] = 0.0
+
+    # Action queries
+    attn_mask[action_q, lan_k] = 0.0
+    attn_mask[action_q, scene_k] = 0.0
+    attn_mask[action_q, motion_k] = 0.0
+
+    if is_video_pad:
+        attn_mask[action_q, video_k] = float("-inf")
+
+    # --------------------------------------------------
+    if batch_size is not None:
+        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, -1, -1)
+
+    return attn_mask
+
+def prepare_attention_mask(
+    N_V, 
+    N_A,
+    batch_size: int | None = None,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32
+):
+    Q_len = N_V + N_A
+    # initialize all masked
+    attn_mask = torch.full(
+        (Q_len, Q_len),
+        float("-inf"),
+        device=device,
+        dtype=dtype,
+    )
+    video_q = slice(0, N_V)
+    action_q = slice(N_V, N_V + N_A)
+    # video can attend action
+    attn_mask[video_q, action_q] = 0.0
+    # video attend self
+    # attn_mask[video_q, video_q] = 0.0
+    # action can attentd video
+    attn_mask[action_q, video_q] = 0.0
+    # action attend self
+    # attn_mask[action_q, action_q] = 0.0
+    if batch_size is not None:
+        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, -1, -1)
+
+    return attn_mask
+
+def forward_c(
+        self,
+        hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        img_encoder_hidden_states: torch.Tensor,
+        condition_len: list, 
+        timestep: torch.Tensor,
+        guidance: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples: Optional[Tuple[torch.Tensor]] = None,
+        return_dict: bool = True,
+        is_video_pad = False,
+        lan_mask = None
+    ) -> Union[Tuple[torch.Tensor, ...], Transformer2DModelOutput]:
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
+
+        # 1. Input
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.config.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+
+        freqs_cos, freqs_sin, freqs_cos_action, freqs_sin_action = self.rope(hidden_states, action_hidden_states)
+        rotary_emb = (freqs_cos, freqs_sin)
+        rotary_emb_action = (freqs_cos_action, freqs_sin_action) # 要加它得在时间维度上，但video latent的时间维度是压缩的，不能复用
+
+        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        if encoder_attention_mask is None:
+            encoder_attention_mask = prepare_encoder_attention_mask_text_condition(
+                N_V = hidden_states.shape[1], N_A = action_hidden_states.shape[1],
+                M_H=condition_len[0], M_L = condition_len[1], M_LS = condition_len[2], M_LM = condition_len[3],
+                batch_size=hidden_states.shape[0], dtype=hidden_states.dtype,
+                device=hidden_states.device, is_video_pad = is_video_pad, 
+                lan_mask = lan_mask
+            )
+            # encoder_attention_mask = prepare_encoder_physical_attention_mask(
+            #     N_V=hidden_states.shape[1], N_A=action_hidden_states.shape[1], 
+            #     M_LS = condition_len[2], M_LM = condition_len[3], T_V=num_frames,
+            #     M_L = condition_len[1],
+            #     batch_size=hidden_states.shape[0], dtype=hidden_states.dtype,
+            #     device=hidden_states.device, is_video_pad = is_video_pad
+            # )
+        if attention_mask is None:
+            attention_mask = prepare_attention_mask(
+                N_V = hidden_states.shape[1], N_A = action_hidden_states.shape[1],
+                batch_size=hidden_states.shape[0], dtype=hidden_states.dtype,
+                device=hidden_states.device
+            )
+        # print(hidden_states.shape) # [10, 1568, 2240] # for 30 frame
+        num_image_token = hidden_states.shape[1]
+        hidden_states = torch.cat([hidden_states, action_hidden_states], dim = 1)
+        
+
+        if guidance is not None:
+            timestep, embedded_timestep = self.time_embed(
+                timestep.flatten(), guidance=guidance, hidden_dtype=hidden_states.dtype
+            )
+        else:
+            # timestep包含shif, scale等参数, embedded_timestep不包含
+            timestep, embedded_timestep = self.time_embed(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype
+            )
+
+        timestep = timestep.view(batch_size, -1, timestep.size(-1))
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
+
+        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+
+        encoder_hidden_states = self.caption_norm(encoder_hidden_states)
+
+        # 2. Transformer blocks
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for index_block, block in enumerate(self.transformer_blocks):
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    img_encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep,
+                    embedded_timestep,
+                    post_patch_num_frames,
+                    post_patch_height,
+                    post_patch_width,
+                    rotary_emb,
+                    rotary_emb_action
+                )
+                if controlnet_block_samples is not None and 0 < index_block <= len(controlnet_block_samples):
+                    hidden_states = hidden_states + controlnet_block_samples[index_block - 1]
+
+        else:
+            for index_block, block in enumerate(self.transformer_blocks):
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    img_encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep,
+                    post_patch_num_frames,
+                    post_patch_height,
+                    post_patch_width,
+                    rotary_emb,
+                )
+                if controlnet_block_samples is not None and 0 < index_block <= len(controlnet_block_samples):
+                    hidden_states = hidden_states + controlnet_block_samples[index_block - 1]
+
+        # 3. Normalization
+        # important otherwise action loss will be very large
+        hidden_states, action_hidden_states = hidden_states[:, :num_image_token], hidden_states[:, num_image_token:]
+        hidden_states = self.norm_out(hidden_states, embedded_timestep)
+        action_hidden_states = self.norm_out_action(action_hidden_states, embedded_timestep)
+        
+        hidden_states = self.proj_out(hidden_states)
+
+        # 5. Unpatchify
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (output, action_hidden_states)
+
+        return Transformer2DModelOutput(sample=output)
+
+class VideoWorldModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        print(f"Load diffusion model from {config.video_pred_model}")
+        self.config = config
+        self.vae = AutoencoderKLWan.from_pretrained(
+            config.video_pred_model,
+            subfolder="vae",
+            local_files_only=True
+        )
+        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal
+        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial
+        self.vae_mean = torch.tensor(self.vae.config.latents_mean)
+        self.vae_std = torch.tensor(self.vae.config.latents_std)
+        # self.vae_std = torch.tensor(latents_std)
+        self.z_dim = self.vae.z_dim
+        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+        # https://github.com/NVlabs/Sana/blob/main/configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp_chunk.yaml#L97
+        self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            config.video_pred_model, 
+            subfolder="scheduler",
+            local_files_only=True
+        )
+        
+        # self.noise_scheduler_action = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        #     config.img_pred_model, 
+        #     subfolder="scheduler",
+        #     local_files_only=True
+        # )
+        
+        self.transformer = SanaVideoTransformer3DModel.from_pretrained(
+            config.video_pred_model, 
+            subfolder="transformer", 
+            locals_files_only=True
+        )
+        self.inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
+        self.transformer.norm_out = Modified_SanaModulatedNorm(self.inner_dim, 
+                                                               elementwise_affine=False, 
+                                                               eps=1e-6, 
+                                                               inner_dim=self.inner_dim)
+        self.transformer.norm_out_action = AdaLNTime(self.inner_dim, 
+                                                               elementwise_affine=False, 
+                                                               eps=1e-6, 
+                                                               inner_dim=self.inner_dim)
+        
+        self.transformer.rope = Modified_WanRotaryPosEmbed(self.transformer.config.attention_head_dim, 
+                                                           self.transformer.config.patch_size, 
+                                                           self.transformer.config.rope_max_seq_len)
+        
+        self.prompt_proj = nn.Linear(self.config.vlm_token_dim, self.transformer.config.caption_channels)
+        
+        self.img_prompt_proj = nn.Linear(self.config.vlm_token_dim, self.inner_dim)
+        
+        # for action
+        self.action_in_proj = nn.Linear(self.config.max_action_dim * 2, self.inner_dim)
+        self.action_out_proj = nn.Linear(self.inner_dim, self.config.max_action_dim)
+        self.action_time_mlp_in = nn.Linear(self.inner_dim * 2, self.inner_dim)
+        self.action_time_mlp_out = nn.Linear(self.inner_dim, self.inner_dim)
+        # self.action_in_proj = nn.Sequential(
+        #     nn.Linear(self.config.max_action_dim, self.inner_dim),
+        #     nn.LayerNorm(self.inner_dim), # 强制限制分布
+        #     nn.SiLU() # 或者 ReLU
+        # )
+        # self.action_out_proj = nn.Sequential(
+        #     nn.Linear(self.inner_dim, self.inner_dim),
+        #     nn.SiLU(),
+        #     nn.Linear(self.inner_dim, self.config.max_action_dim),
+        # )
+        
+        # 梯度检查点
+        self.transformer.enable_gradient_checkpointing()
+        self.vae.requires_grad_(False)
+        self.prepare_modules()
+        self.dtype = torch.bfloat16
+        
+        # print(f"Freeze transformer FFN weights")
+        for name, param in self.transformer.named_parameters():
+            if "ff" in name and "action" not in name:
+                param.requires_grad = False
+        
+        # count parameters
+        total_attn1 = 0
+        total_attn2 = 0
+        total_nolinear = 0
+        total_ffn = 0
+        for name, p in self.transformer.named_parameters():
+            if "attn1" in name:
+                total_attn1 += p.numel()
+            elif "attn2" in name:
+                total_attn2 += p.numel()
+            elif "linear_attn" in name:
+                total_nolinear += p.numel()
+            elif "ff" in name:
+                total_ffn += p.numel()
+                
+        total_transformer = sum(p.numel() for p in self.transformer.parameters())
+        # 3.3B
+        print(f"Video model of transformer total parameters: total: {total_transformer/1e6:.2f}M")
+        # 800M, 400M, 50M
+        print(f"Video model of transformer total parameters: attn1: {total_attn1/1e6:.2f}M, attn2: {total_attn2/1e6:.2f}M, no linear: {total_nolinear/1e6:.2f}M FFN:{total_ffn/1e6:.2f}M")
+
+    def prepare_modules(self):
+        print("Replace Transformer Block")
+        inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
+        old_transformer_weights = self.transformer.state_dict()
+        print(f"Inner dim:{inner_dim}")
+        block_kwargs = dict(
+            dim=inner_dim,
+            num_attention_heads=self.transformer.config.num_attention_heads,
+            attention_head_dim=self.transformer.config.attention_head_dim,
+            dropout=self.transformer.config.dropout,
+            num_cross_attention_heads=self.transformer.config.num_cross_attention_heads,
+            cross_attention_head_dim=self.transformer.config.cross_attention_head_dim,
+            cross_attention_dim=self.transformer.config.cross_attention_dim,
+            attention_bias=self.transformer.config.attention_bias,
+            norm_elementwise_affine=self.transformer.config.norm_elementwise_affine,
+            norm_eps=self.transformer.config.norm_eps,
+            # attention_out_bias=self.transformer.config.attention_out_bias,
+            mlp_ratio=self.transformer.config.mlp_ratio,
+            qk_norm=self.transformer.config.qk_norm,
+            rope_max_seq_len=self.transformer.config.rope_max_seq_len,
+        )
+        # mid_layer = self.transformer.config.num_layers // 2
+        for i in range(self.transformer.config.num_layers):
+            self.transformer.transformer_blocks[i] = Modified_SanaVideoTransformerBlock_V2(**block_kwargs)
+
+        self.transformer.forward = forward_c.__get__(self.transformer)
+        missing_keys, unexpected_key = self.transformer.load_state_dict(old_transformer_weights, strict=False)
+        print(missing_keys)
+        
+        print(f"Replace scale_shift_table...")
+        old_table = self.transformer.scale_shift_table.data 
+        old_table = old_table.view(2, -1)  # [2, 2240]
+
+        new_table = self.transformer.norm_out.scale_shift_table.data  # [2, 2240]
+
+        # 把旧权重扩展拷贝进去
+        new_table[:, :old_table.shape[1]] = old_table
+
+        # 更新 norm_out 的表
+        self.transformer.norm_out.scale_shift_table.data = new_table
+    
+    def get_sigmas(self, timesteps, device, n_dim=4, dtype=torch.float32):
+        sigmas = self.noise_scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = self.noise_scheduler.timesteps.to(device)
+        timesteps = timesteps.to(device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+    
+    def sample_action_noise(self, shape, device):
+        noise = torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=shape,
+            dtype=self.dtype,
+            device=device,
+        )
+        return noise
+
+    def sample_action_time(self, bsize, device):
+        time_beta = sample_beta(1.5, 1.0, bsize, device)
+        time = time_beta * 0.999 + 0.001
+        return time.to(dtype=self.dtype, device=device)
+    
+    def embed_action(self, noisy_actions):
+        embs = []
+        dtype = noisy_actions.dtype
+        device = noisy_actions.device
+
+        # Fuse timestep + action information using an MLP
+        action_emb = self.action_in_proj(noisy_actions)
+        # Add to input tokens
+        embs.append(action_emb)
+        embs = torch.cat(embs, dim=1).to(dtype=dtype, device=device)
+        return embs
+    
+    def prepare_noise_action(self, actions, timesteps, device="cuda"):
+        # action_noise = torch.rand_like(actions) # 均匀分布，no 正态分布
+        action_noise = torch.randn_like(actions)
+        # x_t = self.noise_scheduler.add_noise(actions, action_noise, timesteps)
+        
+        # video loss will be high, action new scheduler
+        sigmas = self.get_sigmas(timesteps, n_dim=actions.ndim, dtype=actions.dtype, device=device)
+        # sigmas = self.sample_action_time(actions.shape[0], device)[:, None, None]
+        x_t = (1.0 - sigmas) * actions + sigmas * action_noise
+        noise_action_embeds = self.embed_action(x_t)
+        # print(torch.max(noise_action_embeds), torch.min(noise_action_embeds))
+        target_action = action_noise - actions
+        return noise_action_embeds, target_action, action_noise
+
+    def prepare_noise_action_v2(self, actions, sigmas, states, device="cuda"):
+        action_noise = torch.randn_like(actions)
+        x_t = (1.0 - sigmas) * actions + sigmas * action_noise
+        
+        # print(sigmas.shape, actions.shape, states.shape)
+        time_emb = create_sinusoidal_pos_embedding(
+            sigmas[:, 0, 0], self.inner_dim, min_period=4e-3, max_period=4.0, device=device
+        )
+        time_emb = time_emb.type(dtype=actions.dtype)
+        
+        B, num_actions = actions.shape[:2]
+        states = states.unsqueeze(1).expand(B, num_actions, states.shape[-1])
+        actions_and_states = torch.cat([x_t, states], dim = -1)
+        noise_action_embeds = self.action_in_proj(actions_and_states)
+        # concat with time embedding
+        time_emb = time_emb[:, None, :].expand_as(noise_action_embeds)
+        action_time_emb = torch.cat([noise_action_embeds, time_emb], dim=2)
+
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)  # swish == silu
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
+        
+        target_action = action_noise - actions
+        return action_time_emb, target_action, action_noise
+
+    def save_video(self, video_latents, save_name):
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(video_latents.device, video_latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            video_latents.device, video_latents.dtype
+        )
+        video_latents = video_latents / latents_std + latents_mean
+        try:
+            video = self.vae.decode(video_latents, return_dict=False)[0]
+        except Exception as e:
+            print(
+                f"{e}. \n"
+                f"Try to use VAE tiling for large images. For example: \n"
+                f"pipe.vae.enable_tiling(tile_sample_min_width=512, tile_sample_min_height=512)"
+            )
+        video = self.video_processor.postprocess_video(video.detach(), output_type="np")[0]
+        if video.dtype != np.uint8:
+            video = (video * 255).clip(0, 255).astype(np.uint8)
+        imageio.mimsave(save_name, video, fps=10)
+    
+    def forward(self, img_embeds, sc_embeds, act_embeds, task_info_dict, target_imgs, actions, states, train_step):
+        # prepare image
+        if task_info_dict:
+            task_embeds = task_info_dict["embeds"]
+            #print(torch.max(task_embeds), torch.min(task_embeds))
+            lan_mask = task_info_dict["attention_mask"]
+            # lan_mask = None
+            # print(lan_mask.shape)
+        else:
+            task_embeds = torch.zeros((img_embeds.shape[0], 0, img_embeds.shape[2]), dtype=img_embeds.dtype, device=img_embeds.device)
+            lan_mask = None
+        prompt_embeds = torch.cat([task_embeds, sc_embeds, act_embeds], dim = 1)
+        # prompt_embeds = torch.cat([sc_embeds, act_embeds], dim = 1)
+        prompt_embeds = self.prompt_proj(prompt_embeds)
+        img_prompt_embeds = self.img_prompt_proj(img_embeds)
+        device = prompt_embeds.device
+        # target_imgs: 10 3 T H W
+        # print(target_imgs.shape) # 224 * 224
+        target_z = self.vae.encode(target_imgs).latent_dist.mode().to(device)
+        bs = target_z.shape[0]
+        # # for logit_normal: for image
+        # u = torch.normal(mean=0.0, std=1.0, size=(bs,), device=device)
+        # u = torch.nn.functional.sigmoid(u)
+        # indices = (u * self.noise_scheduler.config.num_train_timesteps).long().to(device=device)
+        # sch_timesteps = self.noise_scheduler.timesteps.to(device=device)
+        # timesteps = sch_timesteps[indices].to(device=device)
+        # for action sample
+        # https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+        sigmas = self.sample_action_time(bs, device) # high simas corresponds to low timestep
+        video_sigmas = sigmas[:, None, None, None, None]
+        indices = (sigmas * (self.noise_scheduler.config.num_train_timesteps)).long()
+        indices = torch.clamp(indices, 0, self.noise_scheduler.config.num_train_timesteps - 1)
+        sch_timesteps = self.noise_scheduler.timesteps.to(device=device) # 0-num_train_timesteps
+        timesteps = sch_timesteps[indices].to(device=device)
+        # print(timesteps)
+        
+        # print(train_step)
+        if train_step > self.config.action_warm_up_step:
+            # target_z = self.vae.encode(target_imgs).latent_dist.mode().to(device)
+            # print(target_z.shape) # torch.Size([2, 16, 8, 28, 28])
+            vae_mean = self.vae_mean.to(device=device)
+            vae_std = self.vae_std.to(device=device)
+            # follow https://github.com/NVlabs/Sana/blob/main/diffusion/model/wan/vae.py#L497
+            target_z = (target_z - vae_mean.view(1, self.z_dim, 1, 1, 1)) / vae_std.view(1, self.z_dim, 1, 1, 1)
+            # print(target_z.shape) # [10, 16, 8, 28, 28]
+            clean_images = target_z
+            noise = torch.randn_like(clean_images)
+            # sigmas = self.get_sigmas(timesteps, n_dim=clean_images.ndim, dtype=clean_images.dtype, device=device)
+            # noisy_video_input = (1.0 - sigmas) * clean_images + sigmas * noise
+            noisy_video_input = (1.0 - video_sigmas) * clean_images + video_sigmas * noise
+            is_video_pad = False
+        else:
+            # noisy_video_input = torch.zeros_like(target_z).to(dtype=target_z.dtype, device=target_z.device)
+            noisy_video_input = torch.ones_like(target_z).to(dtype=target_z.dtype, device=target_z.device) * 1e-6
+            is_video_pad = True
+
+        # noisy_action_input, action_target, action_noise = self.prepare_noise_action(actions, timesteps)
+        noisy_action_input, action_target, action_noise = self.prepare_noise_action_v2(actions, sigmas[:, None, None], 
+                                                                                       states, device)
+        # print(torch.max(noisy_action_input), torch.min(noisy_action_input))
+        # print(noisy_video_input.shape, noisy_action_input.shape) # torch.Size([10, 16, 8, 28, 28]) torch.Size([10, 30, 2240])
+        model_output = self.transformer(
+            hidden_states=noisy_video_input,
+            action_hidden_states=noisy_action_input,
+            encoder_hidden_states=prompt_embeds,
+            img_encoder_hidden_states=img_prompt_embeds,
+            condition_len = [img_embeds.shape[1], task_embeds.shape[1], sc_embeds.shape[1], act_embeds.shape[1]],
+            timestep=timesteps,
+            return_dict=False,
+            is_video_pad = is_video_pad,
+            lan_mask = lan_mask
+            # mask_index = mask_index
+        )
+        # print(torch.max(model_output[1]), torch.min(model_output[1]))
+        video_pred, action_pred = model_output
+        # print(torch.max(video_pred), torch.min(video_pred)) # after adding action, it become very small (-0.3-0.3, before is -3-3)
+        # print(torch.max(action_pred), torch.min(action_pred))
+        action_pred = self.action_out_proj(action_pred)
+        # torch.Size([10, 16, 8, 28, 28]) torch.Size([10, 30, 2240])
+        # calculate loss
+        if train_step > self.config.action_warm_up_step:
+            weighting = torch.ones_like(video_sigmas)
+            video_target = noise - clean_images
+            # Compute regular loss.
+            video_loss = torch.mean(
+                (weighting.float() * (video_pred.float() - video_target.float()) ** 2).reshape(video_target.shape[0], -1),
+                1,
+            )
+            video_loss = video_loss.mean()
+        else:
+            video_loss = torch.tensor(0.0, device=target_z.device)
+        # print(action_pred)
+        action_loss = F.mse_loss(action_target, action_pred, reduction="none")
+        # print(action_loss)
+        loss = {}
+        loss["video_loss"] = video_loss
+        loss["action_loss"] = action_loss
+        # video_latents = noise - video_pred
+        # # decode video
+        
+        # self.save_video(video_latents, "pred.mp4")
+        # self.save_video(clean_images, "gt.mp4")
+        
+        # action_pred_gt = action_noise - action_pred
+        # action_gt = actions
+        # print(f"Action Delta: {action_pred_gt[0, 0, :16] - action_gt[0, 0, :16]}, GT:{action_gt[0, 0, :16]} Loss: {action_loss.mean()}")
+        # # print("Action Pred:", action_pred_gt[0, 0, :8])
+        # time.sleep(5)
+        return loss
+        
+        
+        
+        
+        
+        

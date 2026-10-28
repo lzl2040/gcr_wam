@@ -1,0 +1,1745 @@
+"""Multi-modal, multi-dataset loader for perception <-> physical contrastive learning.
+
+This loader produces, for every sample:
+
+Perception side
+    * ``image_t0`` / ``image_t1``  : the primary camera at time ``t`` and ``t + horizon``
+    * ``task``                     : the language instruction
+    * ``pair_is_valid``            : 1 for a present, valid current image, including padded tails
+    * ``has_physical``             : 1 only when this sample can form a contrastive pair
+
+Physical side
+    * ``action`` / ``action_mask`` : action chunk in the canonical 40-dim slotted space
+    * ``observation.state`` / ``state_mask`` : state trajectory over the same chunk
+    * ``tactile_signal`` / ``tactile_signal_mask`` : low-dimensional tactile readings at t, t+H
+    * ``tactile_image``  / ``tactile_image_mask``  : tactile camera views at t, t+H
+
+All episode frames may start a window. Beyond the episode end, observations repeat the
+last frame and actions use zero controls with identity ort6d rotations and the last real
+gripper controls before canonical mean/std normalization.
+
+Heterogeneity is handled by :mod:`lerobot.common.datasets.canonical_space`: every dataset is
+mapped into the same slotted vector plus a validity mask, so datasets that only expose joint
+positions, only end-effector poses, or both, all coexist without silently overlapping.
+
+Indexing supports two forms:
+    * ``dataset[i]``                    -> the ``i``-th frame of the flattened source mixture
+    * ``dataset[(ds_idx, frame_idx)]``  -> an explicit sample, used by the contrastive sampler
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import logging
+import os
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tabulate import tabulate
+
+from lerobot.common.datasets.canonical_space import (
+    CANON_DIM,
+    CANON_GRIPPER_INDICES,
+    CANON_ZERO_ACTION,
+    MAX_TACTILE_SIGNAL_DIM,
+    MAX_TACTILE_VIEWS,
+    get_spec,
+    tactile_image_keys,
+    tactile_signal_keys,
+)
+from lerobot.common.datasets.contrastive_sample_pool import (
+    build_or_load_sample_pool,
+    resolve_sample_pool_paths,
+)
+from lerobot.common.datasets.dataset_fps import (
+    evenly_spaced_frame_timestamps as _evenly_spaced_frame_timestamps,
+)
+from lerobot.common.datasets.dataset_fps import resolve_true_fps
+from lerobot.common.datasets.instruction_text import is_real_instruction
+from lerobot.common.datasets.lerobot_dataset_for_ace import (
+    LeRobotDataset,
+    LeRobotDatasetMetadata,
+    resolve_delta_timestamps,
+)
+from lerobot.common.datasets.mixtures import (
+    OXE_NAMED_MIXTURES,
+    expand_dataset_names,
+    resolve_stage2_training_stage,
+)
+from lerobot.common.datasets.oxe_configs import OXE_DATASET_CONFIGS
+from lerobot.common.datasets.transforms import make_temporal_rgb_transform
+from lerobot.common.datasets_v30.dataset_metadata import (
+    LeRobotDatasetMetadata as LeRobotDatasetMetadataV30,
+)
+from lerobot.common.datasets_v30.lerobot_dataset import LeRobotDataset as LeRobotDatasetV30
+from lerobot.common.policies.ace.ftp1_tactile import tactile_image_sensors
+
+logger = logging.getLogger(__name__)
+
+
+def _to_tensor(value) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value
+    try:
+        return torch.as_tensor(value)
+    except Exception:  # noqa: BLE001 - defensive: heterogeneous raw dataset payloads
+        return None
+
+
+def resolve_pair_horizon(
+    fps: float,
+    *,
+    window_mode: str,
+    chunk_size: int,
+    chunk_seconds: float,
+    chunk_frames_min: int,
+    chunk_frames_max: int,
+    frame_horizon: int | None = None,
+) -> int:
+    """How many frames ahead the second image of a pair sits, at this dataset's fps.
+
+    Shared by the contrastive dataset and the vision-only perception dataset so the two
+    training stages cannot drift apart. A perception encoder pre-trained on 1.0s pairs and
+    then fine-tuned against 2.0s action chunks would be reading a different physical event
+    than the one it was taught to describe, and nothing in either pipeline would report it.
+
+    In ``"duration"`` mode the window is a wall-clock span, so a 5 fps and a 30 fps dataset
+    cover the same amount of motion. ``chunk_frames_min``/``chunk_frames_max`` cap the cost of
+    that promise; when the clamp binds, the promise is broken and we say so.
+    """
+    fps = float(fps or 0.0)
+    if not fps > 0:
+        raise ValueError(f"fps must be positive to build a temporal window, got {fps!r}.")
+
+    if window_mode == "frames":
+        # `frame_horizon` still controls how far ahead the *pair* looks; it defaults to the
+        # end of the chunk so the image pair and the action chunk describe the same span.
+        horizon = int(frame_horizon) if frame_horizon is not None else chunk_size - 1
+        return max(1, horizon)
+
+    if frame_horizon is not None:
+        return max(1, int(frame_horizon))
+
+    exact = chunk_seconds * fps
+    horizon = max(chunk_frames_min, min(chunk_frames_max, int(round(exact))))
+    # Outside [chunk_frames_min, chunk_frames_max] the clamp wins and the window is no longer
+    # `chunk_seconds` long, so datasets stop sharing a temporal receptive field. That is a
+    # deliberate cost cap, not a bug, but it should never be silent.
+    if abs(horizon - exact) > 0.5:
+        logger.warning(
+            "fps=%g wants a %.1f-frame window for %.2fs but the clamp gives %d frames "
+            "(%.2fs); this dataset does not share the mixture's temporal window. "
+            "Widen chunk_frames_min/max if that matters.",
+            fps, exact, chunk_seconds, horizon, horizon / fps,
+        )
+    return max(1, horizon)
+
+
+class MultiModalContrastiveDataset(torch.utils.data.Dataset):
+    """Mixture of LeRobot datasets emitting aligned perception/physical modalities."""
+
+    def __init__(
+        self,
+        cfg,
+        image_transforms=None,
+        seed: int = 1000,
+        data_mix: str = "debug_research_data",
+        vla2root_json: str = "vla2root.json",
+        dataset_size_one_epoch: int = 100_000,
+        heldout_eval_dataset_names: tuple[str, ...] = (),
+        heldout_eval_episodes_per_dataset: int = 0,
+        heldout_eval_seed: int = 20_260_927,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.seed = seed
+        self.epoch = 0
+        self.image_transforms = image_transforms
+
+        policy_cfg = cfg.policy
+        self.rgb_augmentation = None
+        if (
+            getattr(policy_cfg, "type", None) == "qwen3vl_mot"
+            and cfg.dataset.image_transforms.enable
+        ):
+            self.rgb_augmentation = make_temporal_rgb_transform(cfg.dataset.image_transforms.img_size)
+            logger.info(
+                "RGB training augmentation enabled: crop area 90-100%, mild color jitter; "
+                "no rotation; shared over each camera window, disabled for validation."
+            )
+        self.full_training_coverage = False
+        if getattr(policy_cfg, "type", None) == "qwen3vl_mot":
+            cfg.stage = resolve_stage2_training_stage(getattr(cfg, "stage", "auto"), data_mix)
+            self.full_training_coverage = cfg.stage == "finetune"
+        self.validation_split = "training" if self.full_training_coverage else "heldout"
+        if self.full_training_coverage:
+            if getattr(cfg.dataset, "sample_pool_enabled", True):
+                logger.info("Downstream finetuning disables sample pools and uses every valid training window.")
+            cfg.dataset.sample_pool_enabled = False
+        self.chunk_size = policy_cfg.chunk_size
+        # "duration" resolves the window from ``chunk_seconds`` per dataset; "frames" uses the
+        # consecutive frames 0..chunk_size-1, which is what downstream VLA training wants.
+        self.window_mode = getattr(policy_cfg, "window_mode", "duration")
+        # Temporal window, expressed in seconds and resolved to a raw frame count per dataset
+        # in ``_window_offsets``. ``frame_horizon`` overrides it with a fixed frame count.
+        self.chunk_seconds = getattr(policy_cfg, "chunk_seconds", 1.6)
+        self.chunk_frames_min = getattr(policy_cfg, "chunk_frames_min", 8)
+        self.chunk_frames_max = getattr(policy_cfg, "chunk_frames_max", 48)
+        self.frame_horizon_override = getattr(policy_cfg, "frame_horizon", None)
+        # Filled in per dataset as they are built, so the resolved windows can be logged.
+        self.frame_horizons: list[int] = []
+        # Wall-clock capture rate per dataset, which is not always the declared one.
+        self.true_fps: list[float] = []
+        self.tactile_img_size = getattr(policy_cfg, "tactile_img_size", 64)
+        self.tactile_frames = max(2, int(getattr(policy_cfg, "tactile_frames", 2)))
+        self.tactile_dead_std = getattr(policy_cfg, "tactile_dead_std", 0.002)
+        self.max_tactile_views = min(getattr(policy_cfg, "max_tactile_views", MAX_TACTILE_VIEWS), MAX_TACTILE_VIEWS)
+        self.world_video_frames = getattr(policy_cfg, "world_video_frames", None)
+        if self.world_video_frames is not None and self.world_video_frames < 2:
+            raise ValueError("`world_video_frames` must be at least 2 when enabled.")
+        self._video_backend = self._resolve_video_backend(cfg.dataset.video_backend)
+        self.use_wrist_image = getattr(policy_cfg, "use_wrist_image", False)
+        self.rgb_views = tuple(getattr(policy_cfg, "rgb_views", ("primary",)))
+
+        mixture_spec = OXE_NAMED_MIXTURES[data_mix]
+        included_datasets, sample_weights = [], []
+        for d_name, d_weight in mixture_spec:
+            if self.full_training_coverage and d_weight == 0:
+                continue
+            if d_name in included_datasets:
+                continue
+            included_datasets.append(d_name)
+            sample_weights.append(d_weight)
+        requested_eval_datasets = expand_dataset_names(heldout_eval_dataset_names)
+        self.heldout_eval_dataset_names = requested_eval_datasets
+        self.heldout_eval_episodes_per_dataset = int(
+            heldout_eval_episodes_per_dataset
+        )
+        self.heldout_eval_seed = int(heldout_eval_seed)
+        training_dataset_names = set(included_datasets)
+        if self.full_training_coverage:
+            validation_only = set(requested_eval_datasets) - training_dataset_names
+            if validation_only:
+                raise ValueError(
+                    "Downstream finetuning validates on training samples; validation datasets "
+                    f"must belong to the training mixture {data_mix!r}: {sorted(validation_only)}."
+                )
+        for dataset_name in requested_eval_datasets:
+            if dataset_name not in training_dataset_names:
+                included_datasets.append(dataset_name)
+                sample_weights.append(0.0)
+
+        with open(vla2root_json) as f:
+            vla2data_root = json.load(f)
+
+        self.datasets: list = []
+        self.dataset_names: list[str] = []
+        self.dataset_sizes: list[int] = []
+        self.specs: list[dict] = []
+        self.image_key_maps: list[dict] = []
+        self.tactile_view_counts: list[int] = []
+        self.norm_stats: list[dict] = []
+        self.episode_ranges: list[np.ndarray] = []
+        self.training_sources: list[bool] = []
+        kept_weights: list[float] = []
+        meta_features = None
+
+        for dataset_name, weight in zip(included_datasets, sample_weights, strict=True):
+            if dataset_name not in vla2data_root:
+                logger.warning("%s missing from %s, skipping.", dataset_name, vla2root_json)
+                continue
+            data_root = self._resolve_root(cfg, vla2data_root[dataset_name])
+            if data_root is None:
+                logger.warning("%s not found on disk, skipping.", dataset_name)
+                continue
+
+            with open(os.path.join(data_root, "meta", "info.json")) as f:
+                info = json.load(f)
+            version = info.get("codebase_version", "v2.1")
+
+            spec = get_spec(
+                dataset_name,
+                action_dim=self._feature_dim(info, "action"),
+                state_dim=self._feature_dim(info, "observation.state"),
+            )
+            if spec.get("perception_only", False):
+                logger.info(
+                    "%s has no physical-side supervision; loading it for perception "
+                    "reconstruction only.",
+                    dataset_name,
+                )
+
+            dataset, ds_meta, img_keys, horizon_ds, true_fps_ds = self._build_dataset(
+                cfg, dataset_name, data_root, version, spec
+            )
+            if dataset is None:
+                continue
+            if meta_features is None:
+                meta_features = dict(ds_meta.features)
+
+            self.datasets.append(dataset)
+            self.dataset_names.append(dataset_name)
+            self.dataset_sizes.append(len(dataset))
+            self.specs.append(spec)
+            self.image_key_maps.append(img_keys)
+            self.tactile_view_counts.append(
+                len(
+                    [
+                        key
+                        for key in tactile_image_keys(spec)
+                        if key in ds_meta.video_keys
+                    ][: self.max_tactile_views]
+                )
+            )
+            self.norm_stats.append(self._build_norm_stats(dataset, spec))
+            self.episode_ranges.append(self._build_episode_ranges(dataset, version))
+            self.training_sources.append(dataset_name in training_dataset_names)
+            # The horizon recorded here is the one ``_build_dataset`` actually read with, not a
+            # recomputation: the sampler trims episodes by it, so a second derivation from a
+            # second fps source could silently disagree with the window the loader used. The
+            # same applies to the true fps, which `sample_rate` is built from.
+            self.frame_horizons.append(horizon_ds)
+            self.true_fps.append(true_fps_ds)
+            declared = float(ds_meta.fps)
+            logger.info(
+                "Dataset: %s: fps=%g%s -> %s window %d frames (%.2fs), %d steps",
+                dataset_name, true_fps_ds,
+                f" (declared {declared:g})" if true_fps_ds != declared else "",
+                self.window_mode, horizon_ds, horizon_ds / true_fps_ds, self.chunk_size,
+            )
+            kept_weights.append(weight)
+
+        if not self.datasets:
+            raise RuntimeError(f"No dataset of mixture '{data_mix}' could be loaded.")
+        missing_eval_datasets = sorted(
+            set(requested_eval_datasets) - set(self.dataset_names)
+        )
+        if missing_eval_datasets:
+            split_label = "training-sample" if self.full_training_coverage else "held-out"
+            raise RuntimeError(
+                f"The requested {split_label} validation datasets could not be loaded: "
+                f"{missing_eval_datasets}."
+            )
+        if self.full_training_coverage:
+            missing_training_datasets = sorted(training_dataset_names - set(self.dataset_names))
+            if missing_training_datasets:
+                raise RuntimeError(
+                    "Finetuning requires every requested training dataset, but these could not be loaded: "
+                    f"{missing_training_datasets}. Refusing to train on a partial mixture."
+                )
+
+        self.all_episode_ranges = [
+            ranges.copy() for ranges in self.episode_ranges
+        ]
+        (
+            self.episode_ranges,
+            self.heldout_episode_ranges,
+            self.heldout_eval_manifest,
+        ) = self._split_heldout_eval_episodes(
+            requested_eval_datasets,
+            heldout_eval_episodes_per_dataset,
+            heldout_eval_seed,
+        )
+
+        # Which datasets carry tactile at all. Tactile is a small slice of most mixtures, so
+        # any metric computed over the whole mixture barely sees it; the evaluator uses this
+        # to build a tactile-only split that can.
+        self.has_tactile = np.array(
+            [bool(tactile_signal_keys(s)) or bool(tactile_image_keys(s)) for s in self.specs],
+            dtype=bool,
+        )
+        self.has_physical = np.array(
+            [
+                not spec.get("perception_only", False)
+                and bool(
+                    spec.get("action")
+                    or spec.get("state")
+                    or tactile_signal_keys(spec)
+                    or tactile_image_keys(spec)
+                )
+                for spec in self.specs
+            ],
+            dtype=bool,
+        )
+
+        # Which physical sensor produced each tactile pad, and the z-score FTP-1 measured for
+        # it. Only the "ftp1" tactile backbone consumes these, but they are cheap (a few
+        # floats per dataset) and building them unconditionally keeps the batch schema fixed,
+        # so the two backbones stay swappable without touching the collate function.
+        self.tactile_sensor_meta = [
+            self._build_tactile_sensor_meta(name, spec)
+            for name, spec in zip(self.dataset_names, self.specs, strict=True)
+        ]
+
+        self.sample_pool = None
+        self.heldout_sample_pool = None
+        sample_pool_enabled = bool(
+            getattr(cfg.dataset, "sample_pool_enabled", True)
+        )
+        pool_root, cache_root = resolve_sample_pool_paths(cfg) if sample_pool_enabled else (None, None)
+        if sample_pool_enabled:
+            self.sample_pool = build_or_load_sample_pool(
+                data_mix=data_mix,
+                dataset_names=self.dataset_names,
+                dataset_sizes=self.dataset_sizes,
+                episode_ranges=self.episode_ranges,
+                true_fps=self.true_fps,
+                horizons=self.frame_horizons,
+                keep_all_below_fps=float(
+                    getattr(
+                        cfg.dataset,
+                        "sample_pool_keep_all_below_fps",
+                        10.0,
+                    )
+                ),
+                target_hz=float(
+                    getattr(cfg.dataset, "sample_pool_target_hz", 5.0)
+                ),
+                pool_root=pool_root,
+                local_cache_root=cache_root,
+            )
+            self.pool_anchor_counts = self.sample_pool.dataset_anchor_counts.copy()
+            self.anchor_strides = self.sample_pool.anchor_strides.copy()
+            self.sample_pool_fingerprint = self.sample_pool.fingerprint
+            self.sample_pool_path = self.sample_pool.storage_dir
+        else:
+            dense_pool = build_or_load_sample_pool(
+                data_mix=f"{data_mix}__dense_runtime",
+                dataset_names=self.dataset_names,
+                dataset_sizes=self.dataset_sizes,
+                episode_ranges=self.episode_ranges,
+                true_fps=self.true_fps,
+                horizons=self.frame_horizons,
+                keep_all_below_fps=max(self.true_fps) + 1.0,
+                target_hz=1.0,
+                pool_root=None,
+                local_cache_root=None,
+            )
+            self.pool_anchor_counts = dense_pool.dataset_anchor_counts
+            self.anchor_strides = dense_pool.anchor_strides
+            self.sample_pool_fingerprint = "disabled"
+            self.sample_pool_path = None
+
+        if self.heldout_eval_manifest:
+            self.heldout_sample_pool = build_or_load_sample_pool(
+                data_mix=f"{data_mix}__{self.validation_split}_generation",
+                dataset_names=self.dataset_names,
+                dataset_sizes=self.dataset_sizes,
+                episode_ranges=self.heldout_episode_ranges,
+                true_fps=self.true_fps,
+                horizons=self.frame_horizons,
+                keep_all_below_fps=max(self.true_fps) + 1.0 if self.full_training_coverage else float(
+                    getattr(
+                        cfg.dataset,
+                        "sample_pool_keep_all_below_fps",
+                        10.0,
+                    )
+                ),
+                target_hz=float(
+                    getattr(cfg.dataset, "sample_pool_target_hz", 5.0)
+                ),
+                pool_root=pool_root if sample_pool_enabled else None,
+                local_cache_root=cache_root if sample_pool_enabled else None,
+            )
+            self.heldout_eval_fingerprint = self.heldout_sample_pool.fingerprint
+            self.heldout_anchor_counts = (
+                self.heldout_sample_pool.dataset_anchor_counts.copy()
+            )
+        else:
+            self.heldout_eval_fingerprint = "disabled"
+            self.heldout_anchor_counts = np.zeros(
+                len(self.datasets),
+                dtype=np.int64,
+            )
+
+        if not np.any(self.pool_anchor_counts > 0):
+            raise RuntimeError(
+                "The temporal sample pool is empty: no nonempty training episodes."
+            )
+        for name, count in zip(
+            self.dataset_names,
+            self.pool_anchor_counts,
+            strict=True,
+        ):
+            if count == 0:
+                logger.warning(
+                    "%s has no nonempty training episode and will not be sampled.",
+                    name,
+                )
+
+        # Weight datasets by valid sample starts, not raw frame count. This prevents a 30 fps
+        # source from retaining its old probability after its redundant starts were thinned.
+        weights = np.array(kept_weights, dtype=np.float64) * self.pool_anchor_counts
+        if weights.sum() <= 0:
+            raise RuntimeError(
+                "Every mixture weight resolves to a dataset with zero valid sample anchors."
+            )
+        self.sample_weights = weights / weights.sum()
+        # Count each distinct RGB camera and tactile stream. Each tactile view also adds
+        # four ResNet frames and two decoder endpoints, so view count is a useful
+        # rank-balancing proxy even though dead-pad masking can reduce the actual GPU work.
+        rgb_view_counts = [
+            max(1, len({keys[role] for role in self.rgb_views if keys.get(role)}))
+            for keys in self.image_key_maps
+        ]
+        self.sample_costs = np.asarray(rgb_view_counts, dtype=np.float64) + np.asarray(
+            self.tactile_view_counts, dtype=np.float64
+        )
+        # This controls the custom batch sampler's epoch length, not the source dataset length.
+        if self.full_training_coverage:
+            dataset_size_one_epoch = int(self.pool_anchor_counts.sum(dtype=np.int64))
+            cfg.dataset.dataset_size_one_epoch = dataset_size_one_epoch
+        self.dataset_size_one_epoch = dataset_size_one_epoch
+
+        self.dataset_statistics = self._build_dataset_statistics()
+        self.dataset_hours = [stat["hours"] for stat in self.dataset_statistics]
+        self.total_source_frames = sum(
+            stat["frames"]
+            for stat in self.dataset_statistics
+            if stat["training_source"]
+        )
+        self.total_source_episodes = sum(
+            stat["episodes"]
+            for stat in self.dataset_statistics
+            if stat["training_source"]
+        )
+        self.total_source_hours = sum(
+            stat["hours"]
+            for stat in self.dataset_statistics
+            if stat["training_source"]
+        )
+        self.total_pool_anchors = int(
+            self.pool_anchor_counts.sum(dtype=np.int64)
+        )
+        if self.full_training_coverage:
+            logger.info(
+                "Full-coverage finetuning: %d windows including padded episode tails, "
+                "%d episodes; validation_split=training. "
+                "Validation episodes remain in training; metrics are not held-out generalization.",
+                self.total_pool_anchors, self.total_source_episodes,
+            )
+        logger.info(
+            "Sample-start pool: fingerprint=%s anchors=%d source_frames=%d table=%s",
+            self.sample_pool_fingerprint,
+            self.total_pool_anchors,
+            self.total_source_frames,
+            (
+                getattr(self.sample_pool.episode_table, "filename", None)
+                if self.sample_pool is not None
+                else "<disabled>"
+            ),
+        )
+        if self.heldout_sample_pool is not None:
+            logger.info(
+                "%s generation validation: fingerprint=%s anchors=%d datasets=%s",
+                "Training-sample" if self.full_training_coverage else "Held-out",
+                self.heldout_eval_fingerprint,
+                int(self.heldout_anchor_counts.sum(dtype=np.int64)),
+                ", ".join(
+                    entry["dataset"] for entry in self.heldout_eval_manifest
+                ),
+            )
+        self._print_dataset_statistics()
+
+        # Flatten integer indexing with one int64 boundary per source dataset. The contrastive
+        # sampler supplies explicit (dataset, frame) tuples, while direct DataLoader users can
+        # traverse every source frame without materialising a multi-million-entry sampling plan.
+        self.dataset_frame_ends = np.cumsum(
+            np.asarray(self.dataset_sizes, dtype=np.int64),
+            dtype=np.int64,
+        )
+        self.dataset_len = int(self.dataset_frame_ends[-1])
+        self.num_episodes = sum(len(ranges) for ranges in self.episode_ranges)
+
+        self.meta = self._build_unified_meta(cfg, meta_features)
+
+    # ------------------------------------------------------------------
+    # construction helpers
+    # ------------------------------------------------------------------
+    def _split_heldout_eval_episodes(
+        self,
+        requested_datasets: tuple[str, ...],
+        episodes_per_dataset: int,
+        seed: int,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[dict]]:
+        if not requested_datasets:
+            empty = [
+                np.empty((0, 2), dtype=np.int64)
+                for _ in self.all_episode_ranges
+            ]
+            return [ranges.copy() for ranges in self.all_episode_ranges], empty, []
+        if episodes_per_dataset <= 0:
+            raise ValueError(
+                "heldout_eval_episodes_per_dataset must be positive when validation "
+                "datasets are configured."
+            )
+
+        requested = set(requested_datasets)
+        train_ranges: list[np.ndarray] = []
+        eval_ranges: list[np.ndarray] = []
+        manifest: list[dict] = []
+        for dataset_idx, (name, ranges, horizon, training_source) in enumerate(
+            zip(
+                self.dataset_names,
+                self.all_episode_ranges,
+                self.frame_horizons,
+                self.training_sources,
+                strict=True,
+            )
+        ):
+            if name not in requested:
+                train_ranges.append(ranges.copy())
+                eval_ranges.append(np.empty((0, 2), dtype=np.int64))
+                continue
+
+            usable = np.flatnonzero(ranges[:, 1] > ranges[:, 0])
+            training_validation = getattr(self, "full_training_coverage", False)
+            required_usable = 1 if training_validation else int(episodes_per_dataset) + int(training_source)
+            if usable.size < required_usable:
+                if training_validation:
+                    raise RuntimeError(
+                        f"{name} has no nonempty episode for horizon={horizon}; "
+                        "training-sample validation requires at least one."
+                    )
+                raise RuntimeError(
+                    f"{name} has {usable.size} usable episodes for horizon={horizon}; "
+                    f"{required_usable} are required to hold out "
+                    f"{episodes_per_dataset}"
+                    + (" while retaining training data." if training_source else ".")
+                )
+            count = min(int(episodes_per_dataset), int(usable.size)) if training_validation else int(episodes_per_dataset)
+            if count < episodes_per_dataset:
+                logger.warning(
+                    "%s has only %d usable episodes; training-sample validation uses all of them "
+                    "instead of the requested %d.", name, count, episodes_per_dataset,
+                )
+
+            digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).digest()
+            dataset_seed = int.from_bytes(digest[:8], "little", signed=False)
+            rng = np.random.default_rng(dataset_seed)
+            heldout_indices = np.sort(
+                rng.choice(usable, size=count, replace=False)
+            )
+            heldout = ranges[heldout_indices].copy()
+            if training_validation and training_source:
+                training = ranges.copy()
+            elif training_source:
+                keep = np.ones(len(ranges), dtype=bool)
+                keep[heldout_indices] = False
+                training = ranges[keep].copy()
+            else:
+                training = np.empty((0, 2), dtype=np.int64)
+
+            train_ranges.append(training)
+            eval_ranges.append(heldout)
+            manifest.append(
+                {
+                    "dataset": name,
+                    "dataset_index": dataset_idx,
+                    "training_source": bool(training_source),
+                    "episode_indices": heldout_indices.tolist(),
+                    "episode_ranges": heldout.tolist(),
+                }
+            )
+        return train_ranges, eval_ranges, manifest
+
+    def heldout_validation_samples(self) -> list[dict[str, int | float | str | bool]]:
+        """Return one fixed, optionally tail-padded anchor per validation episode."""
+        if self.heldout_sample_pool is None:
+            return []
+        samples = []
+        for entry in self.heldout_eval_manifest:
+            dataset_idx = int(entry["dataset_index"])
+            stride = int(self.heldout_sample_pool.anchor_strides[dataset_idx])
+            horizon = int(self.frame_horizons[dataset_idx])
+            for episode_index, (start, end) in zip(
+                entry["episode_indices"],
+                entry["episode_ranges"],
+                strict=True,
+            ):
+                anchor_count = max(
+                    0,
+                    (int(end) - int(start) + stride - 1) // stride,
+                )
+                if anchor_count <= 0:
+                    continue
+                digest = hashlib.sha256(
+                    (
+                        f"{self.heldout_eval_fingerprint}:{entry['dataset']}:"
+                        f"{episode_index}"
+                    ).encode("utf-8")
+                ).digest()
+                rng = np.random.default_rng(
+                    int.from_bytes(digest[:8], "little", signed=False)
+                )
+                anchor = int(start) + int(rng.integers(anchor_count)) * stride
+                sample = {
+                    "dataset": str(entry["dataset"]),
+                    "dataset_index": dataset_idx,
+                    "training_source": bool(entry["training_source"]),
+                    "episode_index": int(episode_index),
+                    "episode_start": int(start),
+                    "episode_end": int(end),
+                    "frame_index": anchor,
+                    "horizon": horizon,
+                    "fps": float(self.true_fps[dataset_idx]),
+                    "anchor_stride": stride,
+                }
+                if getattr(self, "full_training_coverage", False):
+                    sample["validation_split"] = "training"
+                samples.append(sample)
+        return samples
+
+    def heldout_validation_manifest(self) -> dict:
+        manifest = {
+            "format_version": 1,
+            "fingerprint": self.heldout_eval_fingerprint,
+            "dataset_names": list(self.heldout_eval_dataset_names),
+            "episodes_per_dataset": self.heldout_eval_episodes_per_dataset,
+            "split_seed": self.heldout_eval_seed,
+            "samples": self.heldout_validation_samples(),
+        }
+        if getattr(self, "full_training_coverage", False):
+            manifest["validation_split"] = "training"
+        return manifest
+
+    def _build_dataset_statistics(self) -> list[dict[str, str | int | float]]:
+        """Source-data size and wall-clock duration for every loaded dataset.
+
+        Duration uses the resolved capture rate rather than the declared index fps. This
+        matters for FTP-1, whose videos are indexed at 30 Hz but were captured at 15 Hz.
+        These are source totals, independent of mixture weights and the sampled epoch size.
+        """
+        statistics = []
+        for (
+            name,
+            _frames,
+            fps,
+            ratio,
+            episode_ranges,
+            has_physical,
+            anchor_count,
+            anchor_stride,
+            heldout_count,
+            training_source,
+        ) in zip(
+            self.dataset_names,
+            self.dataset_sizes,
+            self.true_fps,
+            self.sample_weights,
+            self.episode_ranges,
+            self.has_physical,
+            self.pool_anchor_counts,
+            self.anchor_strides,
+            self.heldout_anchor_counts,
+            self.training_sources,
+            strict=True,
+        ):
+            if fps <= 0:
+                raise ValueError(f"Dataset {name!r} has non-positive true fps {fps}.")
+            training_frames = int(
+                np.maximum(episode_ranges[:, 1] - episode_ranges[:, 0], 0).sum(
+                    dtype=np.int64
+                )
+            )
+            statistics.append(
+                {
+                    "dataset": name,
+                    "frames": training_frames,
+                    "fps": float(fps),
+                    "hours": float(training_frames) / float(fps) / 3600.0,
+                    "sample_ratio": float(ratio),
+                    "episodes": int(len(episode_ranges)),
+                    "heldout_anchors": int(heldout_count),
+                    "training_source": bool(training_source),
+                    "training": (
+                        "validation-only"
+                        if not training_source
+                        else "finetune" if getattr(self, "full_training_coverage", False)
+                        else "contrastive" if has_physical else "perception-only"
+                    ),
+                    "anchor_count": int(anchor_count),
+                    "anchor_stride": int(anchor_stride),
+                    "anchor_hz": float(fps) / int(anchor_stride),
+                    "anchor_ratio": float(anchor_count) / max(1, training_frames),
+                }
+            )
+        return statistics
+
+    def _print_dataset_statistics(self) -> None:
+        rows = [
+            [
+                stat["dataset"],
+                stat["frames"],
+                f"{stat['fps']:g}",
+                f"{stat['hours']:.2f}",
+                stat["anchor_count"],
+                stat["heldout_anchors"],
+                stat["anchor_stride"],
+                f"{stat['anchor_hz']:.2f}",
+                f"{stat['anchor_ratio']:.3f}",
+                f"{stat['sample_ratio']:.4f}",
+                stat["episodes"],
+                stat["training"],
+            ]
+            for stat in self.dataset_statistics
+        ]
+        rows.append(
+            [
+                "TOTAL",
+                self.total_source_frames,
+                "-",
+                f"{self.total_source_hours:.2f}",
+                self.total_pool_anchors,
+                int(self.heldout_anchor_counts.sum(dtype=np.int64)),
+                "-",
+                "-",
+                f"{self.total_pool_anchors / max(1, self.total_source_frames):.3f}",
+                f"{sum(self.sample_weights):.4f}",
+                self.total_source_episodes,
+                "-",
+            ]
+        )
+        print(
+            tabulate(
+                rows,
+                headers=[
+                    "Dataset",
+                    "Frames",
+                    "FPS",
+                    "Hours",
+                    "Anchors",
+                    "Val anchors",
+                    "Stride",
+                    "Anchor Hz",
+                    "Keep",
+                    "Ratio",
+                    "Episodes",
+                    "Training",
+                ],
+                tablefmt="grid",
+            )
+        )
+
+    @staticmethod
+    def _resolve_root(cfg, relative_root: str) -> str | None:
+        """First root under which ``relative_root`` is an actual LeRobot dataset.
+
+        The test is ``meta/info.json``, not mere directory existence. Datasets are often nested
+        one level deeper than the path in ``vla2root.json`` suggests (``OpenNeoData/aloha`` in
+        fact contains ``aloha/``), and an existence check happily returns that outer directory,
+        so the failure surfaces much later as a confusing FileNotFoundError on info.json rather
+        than as "this dataset was not found".
+        """
+        extra = getattr(cfg.dataset, "parent_dir_extra", "") or ""
+        parents = [cfg.dataset.parent_dir_v21, cfg.dataset.parent_dir_v30]
+        parents += [p.strip() for p in extra.split(",") if p.strip()]
+        for parent in parents:
+            if not parent:
+                continue
+            candidate = os.path.join(parent, relative_root)
+            if os.path.exists(os.path.join(candidate, "meta", "info.json")):
+                return candidate
+            # Tolerate the common one-level nesting (``<root>/<name>/<name>``) rather than
+            # making every such dataset need a hand-edited path.
+            nested = os.path.join(candidate, os.path.basename(relative_root))
+            if os.path.exists(os.path.join(nested, "meta", "info.json")):
+                return nested
+        return None
+
+    @staticmethod
+    def _feature_dim(info: dict, key: str) -> int | None:
+        feature = info.get("features", {}).get(key)
+        if feature is None:
+            return None
+        shape = feature.get("shape")
+        if not shape:
+            return None
+        return int(np.prod(shape))
+
+    def _window_offsets(self, fps: float) -> tuple[list[int], int]:
+        """``(frame_offsets, horizon)`` for one dataset, given its fps.
+
+        Two modes, selected by ``policy.window_mode``, because contrastive pre-training and
+        downstream VLA training want genuinely different things from the same field.
+
+        ``"frames"`` is the ordinary action chunk: the consecutive frames ``0..chunk_size-1`` at
+        the dataset's own rate. A policy that *emits* an action sequence has to produce commands
+        the robot can execute back-to-back, so resampling would either skip commands or emit
+        duplicates. There is nothing to equalise -- the chunk length is the action horizon.
+
+        ``"duration"`` is for the contrastive stage, where the physical branch is never executed,
+        only pooled into an embedding that has to explain a visual change. There a fixed frame
+        count is the wrong unit: 16 frames is 5.3 s at fractal's 3 fps and 0.53 s at 30 fps, so
+        the perception side was being asked to explain wildly different amounts of change for no
+        reason but the recording rate. ``horizon`` raw frames are covered instead, then resampled
+        onto the fixed ``chunk_size`` grid. Two properties are deliberate:
+
+        * **Nearest-frame, not interpolation in time.** Every returned offset is a real frame
+          index, so ``delta_timestamps`` never asks the loader for a timestamp that falls
+          between two frames, which would trip its tolerance check. A window shorter than
+          ``chunk_size`` repeats offsets -- honest, there is no more information to be had --
+          and a longer one strides them.
+        * **The grid spans ``[0, horizon]`` inclusive**, so its last step lands exactly on the
+          frame the perception side uses as ``image_t1``. Dividing by ``chunk_size`` instead of
+          ``chunk_size - 1`` would stop the physical window short of the visual one (46 of 48
+          frames at 30 fps) and, worse, do so by a dataset-dependent amount, quietly breaking
+          the correspondence this whole design rests on.
+
+        The returned length is always ``chunk_size`` in both modes, so the physical token count
+        never varies with the dataset or the mode.
+        """
+        # The caller turns every offset into a timestamp by dividing by fps, so a bad fps is
+        # fatal in both modes, not just the duration one.
+        horizon = resolve_pair_horizon(
+            fps,
+            window_mode=self.window_mode,
+            chunk_size=self.chunk_size,
+            chunk_seconds=self.chunk_seconds,
+            chunk_frames_min=self.chunk_frames_min,
+            chunk_frames_max=self.chunk_frames_max,
+            frame_horizon=self.frame_horizon_override,
+        )
+        if self.window_mode == "frames":
+            return list(range(self.chunk_size)), horizon
+
+        denom = max(1, self.chunk_size - 1)
+        offsets = [round(i * horizon / denom) for i in range(self.chunk_size)]
+        return offsets, horizon
+
+    @staticmethod
+    def _resolve_video_backend(requested: str) -> str:
+        """``torchcodec`` unless it is genuinely unavailable.
+
+        Falling back silently would be worse than failing: the pyav path is ~25x slower on
+        the FTP-1 v3.0 files *and* returns a different dtype, so a run that quietly used it
+        would look like a slow run rather than a broken one. Say so loudly instead.
+        """
+        if requested != "torchcodec":
+            logger.warning(
+                "video_backend=%r: pyav ignores the uint8 request and cannot seek accurately; "
+                "torchcodec is strongly preferred for this pipeline.",
+                requested,
+            )
+            return requested
+        if importlib.util.find_spec("torchcodec") is None:
+            logger.warning("torchcodec is not installed; falling back to pyav (slow, and seeks to keyframes only).")
+            return "pyav"
+        return requested
+
+    def _build_dataset(self, cfg, dataset_name, data_root, version, spec):
+        repo_id = f"bulldog-{dataset_name}"
+        meta_cls = LeRobotDatasetMetadata if version == "v2.1" else LeRobotDatasetMetadataV30
+        ds_meta = meta_cls(repo_id, root=data_root)
+        # Two different fps, and conflating them is a silent data bug.
+        #
+        # ``index_fps`` is what info.json declares, and it is the time base the ``timestamp``
+        # column was written on: frame ``i`` sits at ``i / index_fps``. Every delta_timestamp we
+        # hand the loader must be built with it, or we match the wrong frame.
+        #
+        # ``true_fps`` is the rate the data was really captured at. It decides how much
+        # wall-clock motion a window of ``H`` frames covers, and it is what ``sample_rate``
+        # should report. The two agree for most datasets but not for FTP-1, which declares 30
+        # while capturing at 10-15 Hz -- see ``dataset_fps.py``.
+        index_fps = float(ds_meta.fps)
+        true_fps = resolve_true_fps(dataset_name, index_fps)
+
+        img_keys = self._resolve_image_keys(dataset_name, None, ds_meta=ds_meta)
+        rgb_keys = list(
+            dict.fromkeys(img_keys[role] for role in self.rgb_views if img_keys.get(role))
+        )
+        if self.use_wrist_image and img_keys.get("wrist") and img_keys["wrist"] not in rgb_keys:
+            rgb_keys.append(img_keys["wrist"])
+        tac_img_keys = [k for k in tactile_image_keys(spec) if k in ds_meta.video_keys][
+            : self.max_tactile_views
+        ]
+
+        # Only the action sources this dataset's canonical spec actually reads are chunked;
+        # chunking every ``action.*`` column (e.g. 44-dim hand joints) wastes a lot of IO.
+        wanted_action_keys = {src for src, *_ in spec.get("action", [])}
+        resolved = resolve_delta_timestamps(cfg.policy, ds_meta) or {}
+        delta_timestamps = {k: v for k, v in resolved.items() if k in wanted_action_keys}
+
+        # How far each modality is read over the window is decided by what it costs to read.
+        #
+        # Everything that lives in parquet -- state, action, tactile signal -- is in the same
+        # row group, so the whole chunk comes back for almost nothing. The state trajectory is
+        # worth having next to the action chunk: the action is what was *commanded*, the state
+        # is what actually *happened*, and the visual change we align against is the result of
+        # the latter. The tactile signal is worth having at full rate for a different reason --
+        # a contact transient is a few frames wide, so two samples can straddle it and see
+        # almost nothing of it.
+        #
+        # All three read the *same* grid, which is the duration-based one from
+        # ``_window_offsets``. The action keys are overridden here rather than left to
+        # ``resolve_delta_timestamps``: that helper builds a consecutive-frame chunk from
+        # ``action_delta_indices``, which would put the action on a different time base to the
+        # state and the image pair it is supposed to explain.
+        offsets, horizon = self._window_offsets(true_fps)
+        chunk_stamps = [o / index_fps for o in offsets]
+        for key in wanted_action_keys:
+            if key in ds_meta.features:
+                delta_timestamps[key] = chunk_stamps
+        for key in {src for src, *_ in spec.get("state", [])}:
+            if key in ds_meta.features:
+                delta_timestamps[key] = chunk_stamps
+        for key in tactile_signal_keys(spec):
+            if key in ds_meta.features:
+                delta_timestamps[key] = chunk_stamps
+
+        # The video streams are read at the two ends of the window only. For RGB that is the
+        # whole design; for the tactile cameras it used to be a compromise, and doc/results.md
+        # §21 measured that the compromise was not worth making: the interior of the window
+        # carries structured deformation the endpoints cannot reconstruct (residual 2.4x the
+        # one-frame noise floor, correlated at +0.80 across adjacent frames), and reading it
+        # costs 0.94-1.12x rather than the assumed 2x, because decode time is dominated by
+        # seeking to a keyframe and decoding across the span -- the interior frames are already
+        # being decoded and discarded. Tactile therefore reads ``tactile_frames`` evenly spaced
+        # samples; RGB uses the endpoint pair or the configured world-video grid.
+        if self.world_video_frames is None:
+            rgb_stamps = [0.0, horizon / index_fps]
+        else:
+            rgb_stamps = _evenly_spaced_frame_timestamps(
+                horizon,
+                self.world_video_frames,
+                index_fps,
+            )
+        for key in rgb_keys:
+            if key in ds_meta.features:
+                delta_timestamps[key] = rgb_stamps
+        n_tac = self.tactile_frames
+        tac_stamps = _evenly_spaced_frame_timestamps(horizon, n_tac, index_fps)
+        for key in tac_img_keys:
+            delta_timestamps[key] = tac_stamps
+
+        try:
+            common = dict(
+                root=data_root,
+                delta_timestamps=delta_timestamps or None,
+                image_transforms=None,  # applied per-modality in this class
+                video_backend=self._video_backend,
+                dataset_name=dataset_name,
+            )
+            if version == "v2.1":
+                dataset = LeRobotDataset(repo_id, **common)
+            else:
+                dataset = LeRobotDatasetV30(repo_id, video_return_type="uint8", **common)
+        except Exception as exc:  # noqa: BLE001 - a broken dataset must not kill the whole mixture
+            # The message alone is often useless -- `datasets` reports "An error occurred while
+            # generating the dataset" and keeps the real cause in the chained traceback. Emit it
+            # when DEBUG is on (scripts/probe_contrastive_dataset.py --debug), not during
+            # training, where ten datasets' tracebacks would bury the summary.
+            logger.warning(
+                "Failed to open %s (%s): %s",
+                dataset_name,
+                data_root,
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return None, None, None, None, None
+
+        dataset.video_keys_to_decode = rgb_keys + tac_img_keys
+        return dataset, ds_meta, img_keys, horizon, true_fps
+
+    def _resolve_image_keys(self, dataset_name, dataset, ds_meta=None) -> dict:
+        """Map the OXE ``primary``/``secondary``/``wrist`` roles onto real dataset keys."""
+        meta = ds_meta if ds_meta is not None else dataset.meta
+        available = set(meta.video_keys) | set(getattr(meta, "image_keys", []) or [])
+        config = OXE_DATASET_CONFIGS.get(dataset_name, {})
+        role_map = config.get("image_obs_keys", {})
+
+        resolved = {}
+        for role in ("primary", "secondary", "wrist"):
+            raw = role_map.get(role)
+            resolved[role] = None
+            if raw is None:
+                continue
+            for prefix in ("", "observation.images.", "observations.images.", "images.rgb."):
+                candidate = f"{prefix}{raw}"
+                if candidate in available:
+                    resolved[role] = candidate
+                    break
+        if resolved["primary"] is None:
+            # Fall back to any non-tactile camera so the sample is still usable.
+            for key in sorted(available):
+                if "tactile" not in key:
+                    resolved["primary"] = key
+                    break
+        return resolved
+
+    def _build_norm_stats(self, dataset, spec) -> dict:
+        """Project each dataset's own statistics into the canonical slots.
+
+        Per-dataset (rather than mixture-wide) normalisation is used on purpose: it removes the
+        dataset-specific scale that a contrastive model would otherwise exploit as a shortcut.
+        """
+        stats = getattr(dataset.meta, "stats", None) or {}
+
+        def project(instructions):
+            mean = np.zeros(CANON_DIM, dtype=np.float32)
+            std = np.ones(CANON_DIM, dtype=np.float32)
+            minimum = np.full(CANON_DIM, -np.inf, dtype=np.float32)
+            maximum = np.full(CANON_DIM, np.inf, dtype=np.float32)
+            mask = np.zeros(CANON_DIM, dtype=np.float32)
+            for src_key, s0, s1, d0 in instructions:
+                width = s1 - s0
+                mask[d0 : d0 + width] = 1.0
+                src = stats.get(src_key)
+                if src is None or "mean" not in src:
+                    continue
+                src_mean = np.asarray(src["mean"], dtype=np.float32).reshape(-1)
+                src_std = np.asarray(src["std"], dtype=np.float32).reshape(-1)
+                if src_mean.shape[0] < s1:
+                    continue
+                mean[d0 : d0 + width] = src_mean[s0:s1]
+                std[d0 : d0 + width] = np.maximum(src_std[s0:s1], 1e-3)
+                if "min" in src and "max" in src:
+                    src_min = np.asarray(src["min"], dtype=np.float32).reshape(-1)
+                    src_max = np.asarray(src["max"], dtype=np.float32).reshape(-1)
+                    if src_min.shape[0] >= s1 and src_max.shape[0] >= s1:
+                        minimum[d0 : d0 + width] = src_min[s0:s1]
+                        maximum[d0 : d0 + width] = src_max[s0:s1]
+            return {
+                "mean": torch.from_numpy(mean),
+                "std": torch.from_numpy(std),
+                "min": torch.from_numpy(minimum),
+                "max": torch.from_numpy(maximum),
+                "mask": torch.from_numpy(mask),
+            }
+
+        out = {"action": project(spec.get("action", [])), "state": project(spec.get("state", []))}
+
+        sig_mean = np.zeros(MAX_TACTILE_SIGNAL_DIM, dtype=np.float32)
+        sig_std = np.ones(MAX_TACTILE_SIGNAL_DIM, dtype=np.float32)
+        sig_mask = np.zeros(MAX_TACTILE_SIGNAL_DIM, dtype=np.float32)
+        # The slot layout is decided *here* and handed to `_build_tactile_signal`, rather than
+        # each of them walking its own running offset over the same key list. The two walks skip
+        # on different conditions -- this one skips keys with no statistics, the other skips keys
+        # the item did not return -- so a key present in one and absent in the other would shift
+        # every later slot and silently normalise the wrong dimensions.
+        sig_slots: list[tuple[str, int, int]] = []
+        offset = 0
+        for key in tactile_signal_keys(spec):
+            src = stats.get(key)
+            if src is None or "mean" not in src:
+                continue
+            src_mean = np.asarray(src["mean"], dtype=np.float32).reshape(-1)
+            src_std = np.asarray(src["std"], dtype=np.float32).reshape(-1)
+            width = min(src_mean.shape[0], MAX_TACTILE_SIGNAL_DIM - offset)
+            if width <= 0:
+                break
+            sig_mean[offset : offset + width] = src_mean[:width]
+            sig_std[offset : offset + width] = np.maximum(src_std[:width], 1e-3)
+            sig_mask[offset : offset + width] = 1.0
+            sig_slots.append((key, offset, width))
+            offset += width
+        out["tactile_signal"] = {
+            "mean": torch.from_numpy(sig_mean),
+            "std": torch.from_numpy(sig_std),
+            "mask": torch.from_numpy(sig_mask),
+            "slots": sig_slots,
+        }
+        return out
+
+    @staticmethod
+    def _build_episode_ranges(dataset, version) -> np.ndarray:
+        """``(num_episodes, 2)`` array of ``[from_index, to_index)`` absolute frame ranges."""
+        if version == "v2.1":
+            idx = dataset.episode_data_index
+            starts = np.asarray(idx["from"], dtype=np.int64)
+            ends = np.asarray(idx["to"], dtype=np.int64)
+        else:
+            episodes = dataset.meta.episodes
+            starts = np.asarray(episodes["dataset_from_index"], dtype=np.int64)
+            ends = np.asarray(episodes["dataset_to_index"], dtype=np.int64)
+        return np.stack([starts, ends], axis=1)
+
+    def _build_unified_meta(self, cfg, meta_features):
+        img_feature = None
+        features = {}
+        for key, value in (meta_features or {}).items():
+            if value.get("dtype") in ("image", "video"):
+                img_feature = value
+            else:
+                features[key] = value
+        if img_feature is None:
+            # `names` must be present: `dataset_to_policy_features` indexes it to decide
+            # whether the shape is HWC or CHW, so a None here fails with an opaque
+            # "'NoneType' object is not subscriptable" rather than a missing-metadata error.
+            img_feature = {
+                "dtype": "video",
+                "shape": (224, 224, 3),
+                "names": ["height", "width", "channel"],
+                "info": {},
+            }
+        img_size = cfg.dataset.image_transforms.img_size
+        img_feature = dict(img_feature)
+        img_feature["shape"] = (img_size, img_size, 3)
+        for key in ("observation.images.primary", "observation.images.secondary", "observation.images.wrist"):
+            features[key] = img_feature
+
+        canon = {
+            "dtype": "float32",
+            "shape": (CANON_DIM,),
+            "names": None,
+        }
+        features["action"] = canon
+        features["observation.state"] = canon
+
+        stats = {
+            "action": {
+                "mean": np.zeros(CANON_DIM, dtype=np.float32),
+                "std": np.ones(CANON_DIM, dtype=np.float32),
+                "max": np.ones(CANON_DIM, dtype=np.float32),
+                "min": -np.ones(CANON_DIM, dtype=np.float32),
+                "count": np.array([1]),
+            },
+        }
+        stats["observation.state"] = stats["action"]
+        meta = LeRobotDatasetMetadata.create_with_stats_feats(stats=stats, features=features)
+        meta.repo_id = "Prometheus"
+        return meta
+
+    # ------------------------------------------------------------------
+    # indexing
+    # ------------------------------------------------------------------
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self.dataset_len
+
+    def _resolve_index(self, index) -> tuple[int, int]:
+        if isinstance(index, (tuple, list)) and len(index) == 2:
+            return int(index[0]), int(index[1])
+
+        flat_index = int(index)
+        if flat_index < 0:
+            flat_index += self.dataset_len
+        if flat_index < 0 or flat_index >= self.dataset_len:
+            raise IndexError(
+                f"Index {index} is out of range for dataset of length {self.dataset_len}."
+            )
+
+        ds_idx = int(np.searchsorted(self.dataset_frame_ends, flat_index, side="right"))
+        dataset_start = 0 if ds_idx == 0 else int(self.dataset_frame_ends[ds_idx - 1])
+        return ds_idx, flat_index - dataset_start
+
+    def _random_fallback_index(
+        self,
+        ds_idx: int,
+        requested_frame_idx: int,
+        dataset_length: int,
+        *,
+        sample_pool=None,
+        episode_ranges: list[np.ndarray] | None = None,
+    ) -> int:
+        """Choose a reproducible random replacement that is not the failed frame."""
+        if dataset_length <= 1:
+            return 0
+        seed = np.random.SeedSequence(
+            [
+                int(getattr(self, "seed", 0) or 0),
+                int(getattr(self, "epoch", 0)),
+                ds_idx,
+                requested_frame_idx,
+            ]
+        )
+        rng = np.random.default_rng(seed)
+        if (
+            sample_pool is not None
+            and sample_pool.dataset_anchor_counts[ds_idx] > 0
+        ):
+            return sample_pool.sample_frame_excluding(
+                rng,
+                ds_idx,
+                requested_frame_idx,
+            )
+        if episode_ranges is not None:
+            ranges = episode_ranges[ds_idx]
+            spans = np.maximum(ranges[:, 1] - ranges[:, 0], 0)
+            total = int(spans.sum(dtype=np.int64))
+            if total > 0:
+                logical = int(rng.integers(total))
+                cumulative = np.cumsum(spans, dtype=np.int64)
+                episode = int(np.searchsorted(cumulative, logical, side="right"))
+                previous = 0 if episode == 0 else int(cumulative[episode - 1])
+                candidate = int(ranges[episode, 0]) + logical - previous
+                if total <= 1 or candidate != requested_frame_idx:
+                    return candidate
+                logical = (logical + 1) % total
+                episode = int(np.searchsorted(cumulative, logical, side="right"))
+                previous = 0 if episode == 0 else int(cumulative[episode - 1])
+                return int(ranges[episode, 0]) + logical - previous
+        candidate = int(rng.integers(dataset_length - 1))
+        return candidate + int(candidate >= requested_frame_idx)
+
+    # ------------------------------------------------------------------
+    # item construction
+    # ------------------------------------------------------------------
+    def __getitem__(self, index):
+        ds_idx, frame_idx = self._resolve_index(index)
+        return self._get_item(
+            ds_idx,
+            frame_idx,
+            fallback_pool=getattr(self, "sample_pool", None),
+            fallback_ranges=getattr(self, "episode_ranges", None),
+            augment_rgb=True,
+        )
+
+    def get_heldout_item(self, dataset_idx: int, frame_idx: int) -> dict:
+        if self.heldout_sample_pool is None:
+            raise RuntimeError("No held-out validation episodes are configured.")
+        return self._get_item(
+            int(dataset_idx),
+            int(frame_idx),
+            fallback_pool=self.heldout_sample_pool,
+            fallback_ranges=self.heldout_episode_ranges,
+            augment_rgb=False,
+        )
+
+    def _get_item(
+        self,
+        ds_idx: int,
+        frame_idx: int,
+        *,
+        fallback_pool,
+        fallback_ranges: list[np.ndarray] | None,
+        augment_rgb: bool = False,
+    ) -> dict:
+        dataset = self.datasets[ds_idx]
+        frame_idx = int(np.clip(frame_idx, 0, len(dataset) - 1))
+        requested_frame_idx = frame_idx
+        read_fallback = False
+        try:
+            item = dataset[frame_idx]
+        except Exception as exc:  # noqa: BLE001 - never let one broken frame kill training
+            fallback_idx = self._random_fallback_index(
+                ds_idx,
+                frame_idx,
+                len(dataset),
+                sample_pool=fallback_pool,
+                episode_ranges=fallback_ranges,
+            )
+            logger.warning(
+                "Failed to read %s[%d]: %s; retrying random frame %d from the same dataset.",
+                self.dataset_names[ds_idx],
+                frame_idx,
+                exc,
+                fallback_idx,
+            )
+            try:
+                item = dataset[fallback_idx]
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Failed to read {self.dataset_names[ds_idx]}[{frame_idx}] and random "
+                    f"fallback frame {fallback_idx}."
+                ) from fallback_exc
+            frame_idx = fallback_idx
+            read_fallback = True
+
+        result = self._to_canonical(item, ds_idx, frame_idx)
+        if augment_rgb and getattr(self, "rgb_augmentation", None) is not None:
+            result = self._augment_rgb_window(result)
+        result["data_read_fallback"] = torch.tensor(float(read_fallback), dtype=torch.float32)
+        result["requested_frame_index"] = torch.tensor(requested_frame_idx, dtype=torch.long)
+        return result
+
+    def _augment_rgb_window(self, result: dict) -> dict:
+        if "video_views" not in result:
+            frames = self.rgb_augmentation(torch.cat([
+                torch.stack([result["image_t0"], result["image_t1"]]), result["video"],
+            ]))
+            result["image_t0"], result["image_t1"] = frames[:2]
+            result["video"] = frames[2:]
+            return result
+
+        images = result["images_t0"].clone()
+        videos = result["video_views"].clone()
+        for view in range(videos.shape[0]):
+            if not (result["image_view_mask"][view] or result["video_view_mask"][view]):
+                continue
+            endpoints = [images[view]]
+            if view == 0:
+                endpoints.append(result["image_t1"])
+            frames = self.rgb_augmentation(torch.cat([torch.stack(endpoints), videos[view]]))
+            images[view] = frames[0]
+            videos[view] = frames[len(endpoints):]
+            if view == 0:
+                result["image_t1"] = frames[1]
+        result["images_t0"], result["video_views"] = images, videos
+        result["image_t0"], result["video"] = images[0], videos[0]
+        return result
+
+    @staticmethod
+    def _as_uint8(image: torch.Tensor) -> torch.Tensor:
+        """Frames as uint8 in ``[0, 255]``, whichever convention the decoder used.
+
+        The two return types in this codebase are uint8 in ``[0, 255]`` and float in
+        ``[0, 1]`` (see ``video_return_type``), and which one comes back depends on the
+        backend as much as on the request -- pyav ignores ``video_return_type`` entirely.
+        Casting a ``[0, 1]`` float straight to uint8 truncates every pixel to 0, and leaving
+        it as a float sends a 255x-too-dark image to a normalisation that divides by 255.
+        Both failures are silent: the loss still goes down, on black images.
+
+        Keying off the dtype rather than the observed range is deliberate. A range test
+        ("max <= 1 means [0, 1]") would misfire on a genuinely dark frame, and the dtype is
+        the actual contract.
+        """
+        if image.is_floating_point():
+            image = (image.clamp(0.0, 1.0) * 255.0).round()
+        return image.to(torch.uint8)
+
+    def _resize_rgb(self, image: torch.Tensor) -> torch.Tensor:
+        size = self.cfg.dataset.image_transforms.img_size
+        image = self._as_uint8(image)
+        if image.shape[-1] == size and image.shape[-2] == size:
+            return image
+        return F.interpolate(
+            image.unsqueeze(0).float(), size=(size, size), mode="bilinear", align_corners=False
+        ).squeeze(0).to(torch.uint8)
+
+    def _extract_frames(self, item, primary_key):
+        """Return ``(image_t0, image_t1, pair_is_valid)`` as uint8 CHW tensors."""
+        size = self.cfg.dataset.image_transforms.img_size
+        frames = item.get(primary_key) if primary_key else None
+        if frames is None:
+            zeros = torch.zeros(3, size, size, dtype=torch.uint8)
+            return zeros, zeros.clone(), 0.0
+
+        if frames.ndim == 4:  # (T, C, H, W)
+            first = frames[0]
+            last = frames[-1] if frames.shape[0] > 1 else frames[0]
+            is_pad = item.get(f"{primary_key}_is_pad")
+            valid = 0.0 if (is_pad is not None and bool(is_pad[0])) else 1.0
+        else:
+            first = frames
+            last = frames
+            valid = 0.0
+
+        first = self._resize_rgb(first)
+        last = self._resize_rgb(last)
+        return first, last, valid
+
+    def _extract_video(self, item, primary_key):
+        """Return the evenly sampled RGB window as uint8 ``(T,C,H,W)``."""
+        if self.world_video_frames is None:
+            raise RuntimeError("World-video extraction was requested without `world_video_frames`.")
+        size = self.cfg.dataset.image_transforms.img_size
+        frames = item.get(primary_key) if primary_key else None
+        if frames is None:
+            return torch.zeros(
+                self.world_video_frames,
+                3,
+                size,
+                size,
+                dtype=torch.uint8,
+            )
+        if frames.ndim == 3:
+            frames = frames.unsqueeze(0)
+        if frames.shape[0] < self.world_video_frames:
+            frames = torch.cat(
+                [
+                    frames,
+                    frames[-1:].expand(self.world_video_frames - frames.shape[0], -1, -1, -1),
+                ],
+                dim=0,
+            )
+        frames = self._as_uint8(frames[: self.world_video_frames])
+        if frames.shape[-2:] != (size, size):
+            frames = F.interpolate(
+                frames.float(),
+                size=(size, size),
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0, 255).to(torch.uint8)
+        return frames
+
+    def _extract_rgb_views(self, item: dict, image_keys: dict) -> dict:
+        images, videos, image_mask, video_mask = [], [], [], []
+        seen_keys = set()
+        for role in self.rgb_views:
+            key = image_keys.get(role)
+            # A camera configured under two roles must not become two training targets.
+            if key in seen_keys:
+                key = None
+            if key is not None:
+                seen_keys.add(key)
+            image, _, _ = self._extract_frames(item, key)
+            frames = item.get(key) if key else None
+            padding = item.get(f"{key}_is_pad") if key else None
+            current_valid = frames is not None and (
+                padding is None or not bool(padding[0])
+            )
+            window_valid = current_valid and frames.ndim == 4 and (
+                frames.shape[0] == self.world_video_frames
+            )
+            images.append(image)
+            videos.append(self._extract_video(item, key))
+            image_mask.append(current_valid)
+            video_mask.append(window_valid)
+        return {
+            "images_t0": torch.stack(images),
+            "image_view_mask": torch.tensor(image_mask, dtype=torch.bool),
+            "video_views": torch.stack(videos),
+            "video_view_mask": torch.tensor(video_mask, dtype=torch.bool),
+        }
+
+    def _build_canonical_vector(self, item, instructions, norm, is_chunk: bool, *, zero_pad: bool = False):
+        width = CANON_DIM
+        chunk = self.chunk_size if is_chunk else 1
+        out = torch.zeros(chunk, width, dtype=torch.float32)
+        mask = torch.zeros(width, dtype=torch.float32)
+
+        for src_key, s0, s1, d0 in instructions:
+            value = _to_tensor(item.get(src_key))
+            if value is None:
+                continue
+            value = value.to(torch.float32)
+            padding = None
+            if is_chunk:
+                if value.ndim == 1:
+                    value = value.unsqueeze(0)
+                elif value.ndim > 2:
+                    value = value.reshape(value.shape[0], -1)
+                if zero_pad:
+                    padding = item.get(f"{src_key}_is_pad")
+                    if padding is None:
+                        padding = torch.zeros(value.shape[0], dtype=torch.bool, device=value.device)
+                    padding = torch.as_tensor(padding, dtype=torch.bool, device=value.device)
+                    if padding.ndim != 1 or padding.shape[0] != value.shape[0]:
+                        raise ValueError(f"{src_key}_is_pad must match the action chunk's time dimension.")
+                if value.shape[0] < chunk:
+                    missing = chunk - value.shape[0]
+                    pad = (
+                        value.new_zeros(missing, value.shape[1])
+                        if zero_pad else value[-1:].expand(missing, -1)
+                    )
+                    value = torch.cat([value, pad], dim=0)
+                    if padding is not None:
+                        padding = F.pad(padding, (0, missing), value=True)
+                value = value[:chunk]
+            else:
+                value = value.reshape(-1) if value.ndim == 1 else value.reshape(value.shape[0], -1)[0]
+                value = value.unsqueeze(0)
+            if value.shape[-1] < s1:
+                continue
+            span = s1 - s0
+            value = value[:, s0:s1]
+            if padding is not None and padding[:chunk].any():
+                padding = padding[:chunk]
+                zero_control = value.new_tensor(CANON_ZERO_ACTION[d0 : d0 + span])
+                grippers = [
+                    index - d0 for index in CANON_GRIPPER_INDICES
+                    if d0 <= index < d0 + span and norm["mask"][index] > 0
+                ]
+                if grippers:
+                    real_values = value[~padding]
+                    if real_values.shape[0] == 0:
+                        raise ValueError(
+                            f"Cannot hold padded gripper for {src_key}: action chunk has no real timestep."
+                        )
+                    zero_control[grippers] = real_values[-1, grippers]
+                value = torch.where(padding[:, None], zero_control, value)
+            out[:, d0 : d0 + span] = value
+            mask[d0 : d0 + span] = 1.0
+
+        mask = mask * norm["mask"]
+        out = (out - norm["mean"]) / norm["std"]
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0) * mask
+        return (out if is_chunk else out.squeeze(0)), mask
+
+    def _build_tactile_signal(self, item, spec, norm):
+        """``(chunk, 32)``: the tactile signal over the whole window.
+
+        Read at full rate rather than at the two ends, because a contact transient is only a
+        few frames wide: two samples can straddle it and see almost nothing of it. Unlike the
+        tactile cameras this costs nothing, the signal being a parquet column.
+
+        Slots come from the normalisation stats so that dimension ``i`` of the output always
+        means the same physical channel as dimension ``i`` of ``mean``/``std``/``mask``.
+        """
+        chunk = self.chunk_size
+        signal = torch.zeros(chunk, MAX_TACTILE_SIGNAL_DIM, dtype=torch.float32)
+        found = False
+        for key, offset, width in norm.get("slots", ()):
+            value = _to_tensor(item.get(key))
+            if value is None:
+                continue
+            value = value.to(torch.float32)
+            # A key may come back as (D,) if this dataset had no window to read.
+            value = value.reshape(1, -1) if value.ndim == 1 else value.reshape(value.shape[0], -1)
+            if value.shape[0] < chunk:
+                value = torch.cat([value, value[-1:].expand(chunk - value.shape[0], -1)], dim=0)
+            value = value[:chunk]
+            take = min(width, value.shape[1])
+            signal[:, offset : offset + take] = value[:, :take]
+            found = True
+        if not found:
+            return signal, torch.zeros((), dtype=torch.float32)
+        signal = (signal - norm["mean"]) / norm["std"]
+        signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0) * norm["mask"]
+        return signal, torch.ones((), dtype=torch.float32)
+
+    def _build_tactile_sensor_meta(self, dataset_name, spec):
+        """Per-pad sensor id and z-score, padded out to ``max_tactile_views``.
+
+        Slot order follows ``tactile_image_keys(spec)`` exactly, which is also the slot order
+        ``_build_tactile_images`` writes, so a pad's pixels and its normalisation can never
+        drift apart. Unused slots get id -1; the model never dispatches them because their
+        mask is zero.
+        """
+        keys = tactile_image_keys(spec)[: self.max_tactile_views]
+        ids, means, stds = tactile_image_sensors(dataset_name, len(keys))
+
+        sensor_id = torch.full((self.max_tactile_views,), -1, dtype=torch.long)
+        mean = torch.zeros(self.max_tactile_views, 3, dtype=torch.float32)
+        std = torch.ones(self.max_tactile_views, 3, dtype=torch.float32)
+        for slot in range(len(keys)):
+            sensor_id[slot] = ids[slot]
+            mean[slot] = torch.tensor(means[slot], dtype=torch.float32)
+            std[slot] = torch.tensor(stds[slot], dtype=torch.float32)
+        return sensor_id, mean, std
+
+    def _build_tactile_images(self, item, spec):
+        """``(V, F, 3, S, S)``: each pad sampled at ``F`` points across the window.
+
+        Pads whose frames carry no spatial structure are masked out here. A large share of our
+        tactile pixels are dead: ``sharpa``'s six pads are blank 38-100% of the time and
+        ``RDP_Bimanual``'s right pad is constant for its whole file (measured distributions in
+        ``doc/results.md`` §10.5). A constant image is not a cheap input -- it costs a CNN pass
+        and a physical-sequence token, it is a trivially satisfiable reconstruction target, and
+        it teaches the encoder that "tactile present" often means "tactile says nothing".
+
+        The test is the *spatial* std within each channel, not the std over the whole frame: a
+        pad that is uniformly some non-black colour is spatially dead but has a non-zero global
+        std, so a global test would let it through.
+
+        A pad is dropped only when **every** sampled frame is flat. Testing the two endpoints
+        alone -- which is what this did while only the endpoints were read -- discards exactly
+        the events the interior frames exist to catch: a contact that begins and ends inside
+        the window leaves both endpoints flat, so the pad was marked dead and the event was not
+        merely unobserved but the *cause* of the whole pad being thrown away
+        (``doc/results.md`` §21.2).
+        """
+        size = self.tactile_img_size
+        n_frames = self.tactile_frames
+        dead_std = self.tactile_dead_std
+        views = torch.zeros(self.max_tactile_views, n_frames, 3, size, size, dtype=torch.uint8)
+        mask = torch.zeros(self.max_tactile_views, dtype=torch.float32)
+        for slot, key in enumerate(tactile_image_keys(spec)[: self.max_tactile_views]):
+            frame = item.get(key)
+            if frame is None:
+                continue
+            if frame.ndim == 3:  # (C, H, W) -- no window was read
+                frame = frame.unsqueeze(0)
+            if frame.shape[0] < n_frames:
+                frame = torch.cat(
+                    [frame, frame[-1:].expand(n_frames - frame.shape[0], -1, -1, -1)],
+                    dim=0,
+                )
+            frame = frame[:n_frames]
+            frame = self._as_uint8(frame)
+            frame = F.interpolate(
+                frame.float(), size=(size, size), mode="bilinear", align_corners=False
+            )
+            views[slot] = frame.clamp(0, 255).to(torch.uint8)
+            if dead_std > 0:
+                # Scale to [0, 1] so the threshold is expressed in the same units as the
+                # measured distributions; one 8-bit grey level is 1/255 = 0.0039.
+                spatial_std = (frame / 255.0).reshape(n_frames, 3, -1).std(dim=-1).max()
+                if spatial_std.item() < dead_std:
+                    continue
+            mask[slot] = 1.0
+        return views, mask
+
+    def _to_canonical(self, item, ds_idx, frame_idx):
+        spec = self.specs[ds_idx]
+        norm = self.norm_stats[ds_idx]
+        primary_key = self.image_key_maps[ds_idx]["primary"]
+        action_padding = spec.get("action_padding", "zero_control")
+        if action_padding not in ("zero_control", "repeat_last"):
+            raise ValueError(f"Unsupported action padding mode: {action_padding!r}.")
+
+        image_t0, image_t1, pair_valid = self._extract_frames(item, primary_key)
+        action, action_mask = self._build_canonical_vector(
+            item, spec.get("action", []), norm["action"], True,
+            zero_pad=action_padding == "zero_control",
+        )
+        state, state_mask = self._build_canonical_vector(item, spec.get("state", []), norm["state"], True)
+        tactile_signal, tactile_signal_mask = self._build_tactile_signal(item, spec, norm["tactile_signal"])
+        tactile_image, tactile_image_mask = self._build_tactile_images(item, spec)
+        sensor_id, sensor_mean, sensor_std = self.tactile_sensor_meta[ds_idx]
+        has_physical = bool(
+            action_mask.any().item()
+            or state_mask.any().item()
+            or tactile_signal_mask.item() > 0
+            or tactile_image_mask.any().item()
+        )
+
+        episode_index = int(_to_tensor(item.get("episode_index", 0)).reshape(-1)[0].item())
+        task = item.get("task", "")
+        if isinstance(task, (list, tuple)):
+            task = task[0] if task else ""
+        task = str(task)
+        # Same rule and same two fields as the stage-1 perception loader, so a perception
+        # branch pre-trained there meets an identical batch schema here.
+        has_text = is_real_instruction(task, self.dataset_names[ds_idx])
+
+        result = {
+            "image_t0": image_t0,
+            "image_t1": image_t1,
+            "pair_is_valid": torch.tensor(pair_valid, dtype=torch.float32),
+            "has_physical": torch.tensor(float(has_physical), dtype=torch.float32),
+            "task": task if has_text else "",
+            "has_text": torch.tensor(float(has_text), dtype=torch.float32),
+            "action": action,
+            "action_mask": action_mask,
+            "observation.state": state,
+            "state_mask": state_mask,
+            "tactile_signal": tactile_signal,
+            "tactile_signal_mask": tactile_signal_mask,
+            "tactile_image": tactile_image,
+            "tactile_image_mask": tactile_image_mask,
+            "tactile_sensor_id": sensor_id,
+            "tactile_img_mean": sensor_mean,
+            "tactile_img_std": sensor_std,
+            # Not `item["fps"]`: the v2.1 loader never sets it (so every v2.1 dataset silently
+            # reported 10) and the v3.0 loader sets it from the *declared* fps, which is wrong
+            # for FTP-1. `self.true_fps` is the rate the data was actually captured at.
+            "sample_rate": torch.tensor(int(round(self.true_fps[ds_idx])), dtype=torch.long),
+            "dataset_id": torch.tensor(ds_idx, dtype=torch.long),
+            "episode_uid": torch.tensor(ds_idx * 1_000_000 + episode_index, dtype=torch.long),
+            "frame_index": torch.tensor(frame_idx, dtype=torch.long),
+        }
+        if self.world_video_frames is not None:
+            result["video"] = self._extract_video(item, primary_key)
+            if len(getattr(self, "rgb_views", ("primary",))) > 1:
+                result.update(self._extract_rgb_views(item, self.image_key_maps[ds_idx]))
+        return result
+
+    # ------------------------------------------------------------------
+    @property
+    def num_frames(self) -> int:
+        return int(getattr(self, "total_pool_anchors", self.dataset_len))
+
+    @property
+    def features(self):
+        return self.meta.features
+
+
+def contrastive_collate_fn(batch: list[dict]) -> dict:
+    """Stack tensors, keep language instructions as a python list."""
+    out = {}
+    for key in batch[0]:
+        values = [sample[key] for sample in batch]
+        if isinstance(values[0], torch.Tensor):
+            out[key] = torch.stack(values, dim=0)
+        else:
+            out[key] = values
+    return out

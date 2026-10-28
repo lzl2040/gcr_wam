@@ -1,0 +1,357 @@
+"""Configuration for the Qwen3-VL stage-two mixture-of-transformers model."""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Any
+
+from lerobot.common.optim.optimizers import AdamW8bitConfig
+from lerobot.common.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.configs.policies import PreTrainedConfig
+
+from .tasks import DEFAULT_TASK_NAMES, DEFAULT_TASK_WEIGHTS, TASK_CONTRACT_VERSION, resolve_task_specs
+
+
+@PreTrainedConfig.register_subclass("qwen3vl_mot")
+@dataclass
+class Qwen3VLMoTConfig(PreTrainedConfig):
+    """Stage two: Qwen understanding, stage-one physical tokens, and flow generation."""
+
+    pretrained_path: str | None = None
+    stage1_checkpoint: str = ""
+    stage1_config: str = ""
+    stage1_policy_config: dict[str, Any] | None = None
+    initialize_from_stage1: bool = True
+    require_stage1_vision_transfer: bool = True
+    require_stage1_text_transfer: bool = False
+
+    qwen3vl_dir: str = "/mnt/wangxiaofa/pt_weights/Qwen3-VL-4B-Instruct"
+    cosmos3_dir: str = "/mnt/wangxiaofa/pt_weights/Cosmos3-Edge"
+    # "full" means full tuning of Qwen's multimodal language transformer layers.
+    # The visual backbone still uses LoRA, while token embeddings and the final language
+    # norm remain frozen.
+    understanding_tuning_mode: str = "lora"
+    understanding_lora_rank: int = 16
+    understanding_lora_alpha: int = 16
+    understanding_lora_dropout: float = 0.0
+    understanding_text_lora_layers: int = 0
+    understanding_vision_lora_layers: int = 4
+    understanding_lr_scale: float = 0.1
+    understanding_gradient_checkpointing: bool = True
+    understanding_max_text_tokens: int = 64
+    understanding_kv_layers: int = 8
+
+    num_latent_queries: int = 16
+    latent_action_dim: int = 1024
+    latent_action_loss_weight: float = 1.0
+
+    # Cosmos3-Edge-sized generation path. Qwen3-VL-4B supplies 8 native KV heads
+    # of width 128; the generator expands only its query pathway to 16 heads.
+    generation_hidden_dim: int = 2048
+    generation_depth: int = 28
+    generation_num_heads: int = 16
+    generation_num_kv_heads: int = 8
+    generation_intermediate_dim: int = 9216
+    generation_hidden_act: str = "relu2"
+    generation_dropout: float = 0.0
+    generation_gradient_checkpointing: bool = True
+    # Absent fields preserve the architecture of older stage-two checkpoints.
+    generation_backbone: str = "random"
+    generation_pretrained_dir: str = ""
+    generation_tuning_mode: str = "full"
+    generation_video_fps: float = 24.0
+    video_latent_dim: int = 48
+    video_latent_patch_size: int = 2
+    world_video_frames: int = 9
+    video_image_size: int = 256
+    rgb_views: tuple[str, ...] = ("primary",)
+    load_vae_decoder: bool = False
+
+    chunk_size: int = 32
+    group_size: int = 4
+    n_action_steps: int = 32
+    max_action_dim: int = 40
+    max_state_dim: int = 40
+    max_tactile_signal_dim: int = 32
+    physical_hidden_dim: int = 1024
+    physical_tuning_mode: str = "frozen"
+    # Saved configs without this field retain the original raw-space flow contract.
+    physical_flow_space: str = "raw"
+    # Accepted only to read older configs; clean physical codec losses are retired.
+    physical_reconstruction_loss_weight: float | None = None
+    action_prediction_reconstruction_loss_weight: float | None = None
+    state_prediction_reconstruction_loss_weight: float | None = None
+    physical_lr_scale: float = 0.3
+    max_tactile_views: int = 6
+    tactile_tokens_per_pad: int = 2
+    use_tactile_conditioning: bool = False
+
+    task_names: tuple[str, ...] = DEFAULT_TASK_NAMES
+    task_weights: tuple[float, ...] = DEFAULT_TASK_WEIGHTS
+    task_contract_version: int = TASK_CONTRACT_VERSION
+    sigma_min: float = 1e-3
+    sigma_max: float = 0.999
+    time_sampling_distribution: str = "uniform"
+    time_sampling_shift: float = 1.0
+    time_sampling_beta_alpha: float = 1.5
+    time_sampling_beta_beta: float = 1.0
+    time_sampling_beta_probability: float = 0.5
+    video_loss_weight: float = 1.0
+    action_loss_weight: float = 1.0
+    state_loss_weight: float = 1.0
+    tactile_loss_weight: float = 0.25
+    # "context_tokens" preserves checkpoints trained against physical-transformer tactile
+    # tokens. "spatial_patches" predicts the ResNet codec's future spatial latent, which the
+    # transferred tactile decoder can turn back into an RGB tactile image.
+    tactile_generation_target: str = "context_tokens"
+    inference_steps: int = 20
+
+    # Stage two predicts executable action chunks, so these must be consecutive source
+    # commands rather than the duration-resampled trajectories used by stage-one contrastive
+    # pre-training. Video is sampled sparsely inside the same [t, t + chunk_size - 1] window.
+    window_mode: str = "frames"
+    chunk_seconds: float = 1.6
+    chunk_frames_min: int = 8
+    chunk_frames_max: int = 48
+    frame_horizon: int | None = None
+    tactile_img_size: int = 112
+    tactile_frames: int = 4
+    tactile_dead_std: float = 0.002
+    use_wrist_image: bool = False
+    same_dataset_frac: float = 0.75
+    episode_group_frac: float = 0.75
+    episode_group_size: int = 8
+    min_frame_gap: int = 32
+
+    optimizer_lr: float = 1e-4
+    optimizer_betas: tuple[float, float] = (0.9, 0.95)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 0.01
+    scheduler_warmup_steps: int = 500
+    scheduler_plateau_steps: int = 2_000
+    scheduler_decay_steps: int = 100_000
+    scheduler_decay_lr: float = 1.5e-6
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.task_contract_version != TASK_CONTRACT_VERSION:
+            raise ValueError(
+                "Unsupported task contract version. Use a fresh experiment with the current task definitions."
+            )
+        if self.generation_backbone not in ("random", "edge", "nano"):
+            raise ValueError("`generation_backbone` must be random, edge, or nano.")
+        if self.generation_tuning_mode not in ("full", "frozen"):
+            raise ValueError("`generation_tuning_mode` must be full or frozen.")
+        if self.generation_backbone == "random" and self.generation_tuning_mode != "full":
+            raise ValueError("A randomly initialized generation backbone cannot be frozen.")
+        if not math.isfinite(self.generation_video_fps) or self.generation_video_fps <= 0:
+            raise ValueError("`generation_video_fps` must be finite and positive.")
+        if self.generation_backbone != "random":
+            from .cosmos3_pretrained import COSMOS_GENERATION_CONFIGS
+
+            native = COSMOS_GENERATION_CONFIGS[self.generation_backbone]
+            for name, source in {
+                "generation_hidden_dim": "hidden_size",
+                "generation_depth": "num_hidden_layers",
+                "generation_num_heads": "num_attention_heads",
+                "generation_num_kv_heads": "num_key_value_heads",
+                "generation_intermediate_dim": "intermediate_size",
+                "generation_hidden_act": "hidden_act",
+                "video_latent_dim": "latent_channel",
+                "video_latent_patch_size": "latent_patch_size",
+            }.items():
+                setattr(self, name, native[source])
+            if self.generation_dropout != 0:
+                raise ValueError("Native pretrained Cosmos generation requires generation_dropout=0.")
+        if self.understanding_tuning_mode not in ("frozen", "lora", "full"):
+            raise ValueError(
+                "`understanding_tuning_mode` must be 'frozen', 'lora', or 'full', got "
+                f"{self.understanding_tuning_mode!r}."
+            )
+        if self.understanding_text_lora_layers < 0 or self.understanding_vision_lora_layers < 0:
+            raise ValueError("Understanding LoRA layer counts must be non-negative.")
+        if (
+            self.understanding_tuning_mode == "lora"
+            and self.understanding_text_lora_layers == 0
+            and self.understanding_vision_lora_layers == 0
+        ):
+            raise ValueError(
+                "LoRA tuning requires at least one text or vision layer."
+            )
+        if (
+            self.understanding_tuning_mode == "full"
+            and self.understanding_text_lora_layers != 0
+        ):
+            raise ValueError(
+                "Full VLM-transformer tuning keeps the text embedding path free of LoRA; "
+                "set `understanding_text_lora_layers=0`."
+            )
+        if (
+            self.understanding_tuning_mode == "full"
+            and self.understanding_vision_lora_layers == 0
+        ):
+            raise ValueError(
+                "Full VLM-transformer tuning still adapts the visual backbone with LoRA; "
+                "set `understanding_vision_lora_layers` to a positive value."
+            )
+        if self.physical_tuning_mode not in ("frozen", "full"):
+            raise ValueError(
+                "`physical_tuning_mode` must be 'frozen' or 'full', got "
+                f"{self.physical_tuning_mode!r}."
+            )
+        if self.physical_flow_space not in ("raw", "embedding"):
+            raise ValueError("`physical_flow_space` must be 'raw' or 'embedding'.")
+        for name in ("action", "state"):
+            field_name = f"{name}_prediction_reconstruction_loss_weight"
+            weight = getattr(self, field_name)
+            if weight is None:
+                weight = 0.1 if self.physical_flow_space == "embedding" else 0.0
+                setattr(self, field_name, weight)
+            if not (math.isfinite(weight) and weight >= 0):
+                raise ValueError(f"`{field_name}` must be finite and non-negative.")
+        if self.physical_reconstruction_loss_weight is not None:
+            logging.getLogger(__name__).warning(
+                "Clean physical codec reconstruction has been removed; legacy "
+                "`physical_reconstruction_loss_weight` is ignored. Only predicted-embedding "
+                "reconstruction remains (action weight=%s, state weight=%s).",
+                self.action_prediction_reconstruction_loss_weight,
+                self.state_prediction_reconstruction_loss_weight,
+            )
+            self.physical_reconstruction_loss_weight = None
+        if self.physical_flow_space == "embedding" and self.physical_tuning_mode != "frozen":
+            raise ValueError("Embedding-space physical flow requires a frozen Physical Encoder.")
+        if self.chunk_size <= 0 or self.group_size <= 0 or self.chunk_size % self.group_size:
+            raise ValueError(
+                f"`chunk_size` ({self.chunk_size}) must be divisible by positive "
+                f"`group_size` ({self.group_size})."
+            )
+        if not 1 <= self.n_action_steps <= self.chunk_size:
+            raise ValueError(
+                f"`n_action_steps` must be in [1, chunk_size], got {self.n_action_steps} "
+                f"for chunk_size={self.chunk_size}."
+            )
+        if self.window_mode != "frames":
+            raise ValueError(
+                "qwen3vl_mot requires `window_mode='frames'` so action/state chunks are "
+                "consecutive executable commands."
+            )
+        if self.frame_horizon not in (None, self.chunk_size - 1):
+            raise ValueError(
+                "`frame_horizon` must be unset or equal to `chunk_size - 1` in frame mode; "
+                "otherwise video and action would end at different timesteps."
+            )
+        if self.world_video_frames < 2:
+            raise ValueError("`world_video_frames` must contain the current and at least one future frame.")
+        if (self.world_video_frames - 1) % 4:
+            raise ValueError(
+                "Wan's causal temporal stride requires `world_video_frames = 1 + 4*k`; "
+                f"got {self.world_video_frames}."
+            )
+        if self.video_image_size <= 0 or self.video_image_size % 16:
+            raise ValueError("`video_image_size` must be positive and divisible by the VAE stride 16.")
+        if self.generation_hidden_dim % self.generation_num_heads:
+            raise ValueError(
+                f"`generation_hidden_dim` ({self.generation_hidden_dim}) must be divisible by "
+                f"`generation_num_heads` ({self.generation_num_heads})."
+            )
+        if not 1 <= self.generation_num_kv_heads <= self.generation_num_heads:
+            raise ValueError(
+                "`generation_num_kv_heads` must be positive and no larger than "
+                "`generation_num_heads`."
+            )
+        if self.generation_num_heads % self.generation_num_kv_heads:
+            raise ValueError(
+                "`generation_num_heads` must be divisible by `generation_num_kv_heads`."
+            )
+        if self.generation_intermediate_dim <= 0:
+            raise ValueError("`generation_intermediate_dim` must be positive.")
+        if self.generation_hidden_act not in ("silu", "relu2"):
+            raise ValueError("`generation_hidden_act` must be 'silu' or 'relu2'.")
+        if self.video_latent_patch_size <= 0:
+            raise ValueError("`video_latent_patch_size` must be positive.")
+        if self.understanding_kv_layers < 1:
+            raise ValueError("`understanding_kv_layers` must be positive.")
+        if not 0 <= self.sigma_min < self.sigma_max <= 1:
+            raise ValueError(
+                f"Expected 0 <= sigma_min < sigma_max <= 1, got "
+                f"{self.sigma_min} and {self.sigma_max}."
+            )
+        if self.time_sampling_distribution not in ("uniform", "beta", "mixed", "shifted_uniform"):
+            raise ValueError(
+                "`time_sampling_distribution` must be 'uniform', 'beta', 'mixed', or 'shifted_uniform'."
+            )
+        for name in ("time_sampling_beta_alpha", "time_sampling_beta_beta", "time_sampling_shift"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(f"`{name}` must be finite and positive.")
+        if not (
+            math.isfinite(self.time_sampling_beta_probability)
+            and 0 <= self.time_sampling_beta_probability <= 1
+        ):
+            raise ValueError("`time_sampling_beta_probability` must be finite and in [0, 1].")
+        if self.tactile_generation_target not in (
+            "context_tokens",
+            "spatial_patches",
+        ):
+            raise ValueError(
+                "`tactile_generation_target` must be 'context_tokens' or "
+                "'spatial_patches', got "
+                f"{self.tactile_generation_target!r}."
+            )
+        if (
+            not self.rgb_views
+            or self.rgb_views[0] != "primary"
+            or len(set(self.rgb_views)) != len(self.rgb_views)
+            or any(view not in ("primary", "secondary", "wrist") for view in self.rgb_views)
+        ):
+            raise ValueError(
+                "`rgb_views` must start with primary and contain unique roles from "
+                "primary, secondary, wrist."
+            )
+        resolve_task_specs(self.task_names, self.task_weights)
+
+    @property
+    def num_groups(self) -> int:
+        return self.chunk_size // self.group_size
+
+    @property
+    def observation_delta_indices(self) -> None:
+        return None
+
+    @property
+    def action_delta_indices(self) -> list[int]:
+        return list(range(self.chunk_size))
+
+    @property
+    def reward_delta_indices(self) -> None:
+        return None
+
+    def validate_features(self) -> None:
+        if self.physical_flow_space != "embedding" and any(
+            weight is not None and weight > 0 for weight in (
+                self.action_prediction_reconstruction_loss_weight,
+                self.state_prediction_reconstruction_loss_weight,
+            )
+        ):
+            raise ValueError("Predicted physical reconstruction requires embedding-space physical flow.")
+        return None
+
+    def get_optimizer_preset(self) -> AdamW8bitConfig:
+        return AdamW8bitConfig(
+            lr=self.optimizer_lr,
+            betas=self.optimizer_betas,
+            eps=self.optimizer_eps,
+            weight_decay=self.optimizer_weight_decay,
+        )
+
+    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
+        return CosineDecayWithWarmupSchedulerConfig(
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.scheduler_decay_lr,
+            num_warmup_steps=self.scheduler_warmup_steps,
+            num_platform_steps=self.scheduler_plateau_steps,
+            num_decay_steps=self.scheduler_decay_steps,
+            decay_from_platform_end=True,
+        )

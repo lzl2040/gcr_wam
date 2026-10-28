@@ -1,0 +1,100 @@
+#!/usr/bin/env python
+
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from dataclasses import dataclass, field
+
+from lerobot.common import (
+    policies,  # noqa: F401
+)
+from lerobot.common.datasets.transforms import ImageTransformsConfig
+
+
+@dataclass
+class DatasetConfig:
+    # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
+    # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
+    # "dataset_index" into the returned item. The index mapping is made according to the order in which the
+    # datasets are provided.
+    repo_id: str
+    # Root directory where the dataset will be stored (e.g. 'dataset/path').
+    root: str | None = None
+    episodes: list[int] | None = None
+    image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
+    wrist_image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
+    revision: str | None = None
+    use_imagenet_stats: bool = True
+    balance_dataset_weights: bool = True
+    # torchcodec, not pyav. Two reasons, both measured on the FTP-1 datasets:
+    #   * pyav ignores `video_return_type`, so a caller that asks for uint8 frames silently
+    #     gets float32 in [0, 1] instead. Anything that then treats them as [0, 255] pixels
+    #     -- e.g. an ImageNet normalisation that divides by 255 -- sees a black image.
+    #   * pyav cannot seek accurately, so `decode_video_frames_torchvision` sets
+    #     `keyframes_only=True` and returns the nearest *keyframe* rather than the nearest
+    #     frame, and it rebuilds a reader per call. On a v3.0 file holding 1.2M frames that
+    #     costs ~0.5 s per stream per sample; the cached torchcodec decoder costs ~1 ms.
+    # torchvision's video API is deprecated upstream as well.
+    video_backend: str = "torchcodec"
+    default_image_size: int = 224
+    default_channel_size: int = 3
+    sample_ratio: float = 1.0
+    dataset_size_one_epoch: int = 1000_0000
+    processor: str = "/mnt/wangxiaofa/qwen_params/Qwen2.5-VL-7B-Instruct/"
+    parent_dir: str = "/mnt/wangxiaofa/robot_dataset/lerobot-format/"
+    parent_dir_v21: str = "/mnt/wangxiaofa/robot_dataset/lerobot-format/"
+    parent_dir_v30: str = "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/"
+    # Extra roots searched after the two above, for datasets that live on a different mount
+    # (an external disk, a blob mirror). Comma-separated so it can be set from the CLI.
+    parent_dir_extra: str = ""
+    # Persist a compact pool of valid temporal-window start frames. Only one row per episode is
+    # stored; action/state inside each sampled window remain consecutive at the source frame rate.
+    sample_pool_enabled: bool = True
+    sample_pool_root: str | None = None
+    sample_pool_cache_dir: str | None = None
+    sample_pool_keep_all_below_fps: float = 10.0
+    sample_pool_target_hz: float = 5.0
+    calvin_sub_task: int | None = 0
+
+
+@dataclass
+class WandBConfig:
+    enable: bool = False
+    # Set to true to disable saving an artifact despite training.save_checkpoint=True
+    disable_artifact: bool = False
+    project: str = "lerobot"
+    entity: str | None = None
+    notes: str | None = None
+    id: str | None = None
+    # id: str = "7258056839.59298-05824d03-26a7-488c-abda-e9b82731f1c5"
+
+
+@dataclass
+class EvalConfig:
+    n_episodes: int = 50
+    # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
+    batch_size: int = 50
+    # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
+    use_async_envs: bool = False
+
+    def __post_init__(self):
+        if self.batch_size > self.n_episodes:
+            raise ValueError(
+                "The eval batch size is greater than the number of eval episodes "
+                f"({self.batch_size} > {self.n_episodes}). As a result, {self.batch_size} "
+                f"eval environments will be instantiated, but only {self.n_episodes} will be used. "
+                "This might significantly slow down evaluation. To fix this, you should update your command "
+                f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
+                f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
+            )

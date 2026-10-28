@@ -1,0 +1,867 @@
+#!/usr/bin/env python
+"""DeepSpeed entry point for contrastive stage one and Qwen3-VL MoT stage two.
+
+This is the counterpart of ``dps_train_ace.py`` for the ``robo_contrast`` policy. It is a
+separate script because the data path is fundamentally different: batches are built by a
+``ContrastiveBatchSampler`` for pretraining or a ``FullCoverageBatchSampler`` for downstream
+finetuning. The batch carries images, language, canonical state/action and tactile all at once.
+"""
+
+import json
+import logging
+import math
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from pprint import pformat
+from typing import Any, Sequence
+
+import deepspeed
+import torch
+from termcolor import colored
+from torch import distributed as dist
+from torch.utils.data import DataLoader
+
+from lerobot.common.datasets.contrastive_dataset import (
+    MultiModalContrastiveDataset,
+    contrastive_collate_fn,
+)
+from lerobot.common.datasets.contrastive_eval import build_eval_loaders, evaluate
+from lerobot.common.datasets.contrastive_sample_pool import (
+    sample_pool_checkpoint_state,
+    validate_sample_pool_resume,
+)
+from lerobot.common.datasets.contrastive_sampler import ContrastiveBatchSampler, FullCoverageBatchSampler
+from lerobot.common.datasets.mixtures import resolve_stage2_training_stage
+from lerobot.common.optim.factory import make_optimizer_and_scheduler
+from lerobot.common.policies.factory import make_policy
+from lerobot.common.policies.qwen3vl_mot.tasks import resolve_task_specs
+from lerobot.common.utils.deepspeed_checkpoint import (
+    DATA_PARALLEL_WORLD_SIZE_KEY,
+    OPTIMIZER_GROUP_SIGNATURE_KEY,
+    align_fresh_scheduler_to_step,
+    load_checkpoint_with_optimizer_fallback,
+    optimizer_group_signature,
+)
+from lerobot.common.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.common.utils.random_utils import set_seed
+from lerobot.common.utils.utils import format_big_number
+from lerobot.common.utils.wandb_utils import WandBLogger
+from lerobot.configs import parser
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.train import TrainPipelineConfig
+
+# Images stay uint8 all the way to the GPU (4x less PCIe traffic than bf16) and are
+# normalised inside the model; index-like tensors must stay integral.
+_KEEP_DTYPE_KEYS = ("image_t0", "image_t1", "images_t0", "video", "video_views", "tactile_image")
+_EXTRA_TRAINING_EPOCHS = 100
+
+
+@dataclass
+class ContrastiveTrainPipelineConfig(TrainPipelineConfig):
+    stage: str = "auto"
+    max_epochs: int | None = None
+
+    def validate(self):
+        if self.max_epochs is not None and (
+            type(self.max_epochs) is not int or self.max_epochs <= 0
+        ):
+            raise ValueError("max_epochs must be a positive integer.")
+        super().validate()
+
+
+def _make_training_sampler(
+    cfg: TrainPipelineConfig,
+    dataset: MultiModalContrastiveDataset,
+    batch_size: int,
+    world_size: int,
+    rank: int,
+) -> ContrastiveBatchSampler | FullCoverageBatchSampler:
+    if getattr(dataset, "full_training_coverage", False):
+        return FullCoverageBatchSampler(
+            episode_ranges=dataset.episode_ranges, sample_weights=dataset.sample_weights,
+            batch_size=batch_size, num_replicas=world_size, rank=rank, seed=cfg.seed,
+            horizon=dataset.frame_horizons, dataset_names=dataset.dataset_names,
+        )
+    return ContrastiveBatchSampler(
+        episode_ranges=dataset.episode_ranges, sample_weights=dataset.sample_weights,
+        batch_size=batch_size, num_replicas=world_size, rank=rank, seed=cfg.seed,
+        samples_per_epoch=cfg.dataset.dataset_size_one_epoch,
+        horizon=dataset.frame_horizons, same_dataset_frac=cfg.policy.same_dataset_frac,
+        episode_group_frac=cfg.policy.episode_group_frac, episode_group_size=cfg.policy.episode_group_size,
+        min_frame_gap=cfg.policy.min_frame_gap, sample_costs=dataset.sample_costs,
+        dataset_has_physical=dataset.has_physical,
+        min_physical_per_batch=0 if cfg.policy.type == "qwen3vl_mot" else 2,
+        balance_across_ranks=True, sample_pool=dataset.sample_pool,
+    )
+
+
+def _training_sampler_checkpoint_state(
+    sampler: ContrastiveBatchSampler | FullCoverageBatchSampler,
+) -> dict[str, str]:
+    if isinstance(sampler, FullCoverageBatchSampler):
+        return {"full_training_sampler_fingerprint": sampler.fingerprint}
+    return {}
+
+
+def _validate_training_sampler_resume(
+    sampler: ContrastiveBatchSampler | FullCoverageBatchSampler,
+    state: dict[str, Any],
+) -> None:
+    expected = _training_sampler_checkpoint_state(sampler).get("full_training_sampler_fingerprint")
+    saved = state.get("full_training_sampler_fingerprint")
+    if saved != expected:
+        logging.getLogger(__name__).warning(
+            "The full-coverage training sampler changed across resume: checkpoint=%s, current=%s. "
+            "Continuing with the current sampler; sample order will not be an exact continuation.",
+            saved,
+            expected,
+        )
+
+
+@dataclass(frozen=True)
+class EpochSchedule:
+    steps_per_epoch: int
+    global_samples_per_step: int
+    samples_per_epoch: int
+    source_equivalent_epochs: int
+    extra_epochs: int
+    total_epochs: int
+    source_equivalent_steps: int
+    total_steps: int
+
+
+def _compute_epoch_schedule(
+    total_source_frames: int,
+    steps_per_epoch: int,
+    global_samples_per_step: int,
+    extra_epochs: int = _EXTRA_TRAINING_EPOCHS,
+    max_epochs: int | None = None,
+) -> EpochSchedule:
+    if total_source_frames <= 0:
+        raise ValueError("total_source_frames must be positive.")
+    if steps_per_epoch <= 0:
+        raise ValueError("steps_per_epoch must be positive.")
+    if global_samples_per_step <= 0:
+        raise ValueError("global_samples_per_step must be positive.")
+    if extra_epochs < 0:
+        raise ValueError("extra_epochs must be non-negative.")
+    if max_epochs is not None and (type(max_epochs) is not int or max_epochs <= 0):
+        raise ValueError("max_epochs must be a positive integer.")
+
+    samples_per_epoch = steps_per_epoch * global_samples_per_step
+    source_equivalent_epochs = math.ceil(total_source_frames / samples_per_epoch)
+    total_epochs = source_equivalent_epochs + extra_epochs if max_epochs is None else max_epochs
+    return EpochSchedule(
+        steps_per_epoch=steps_per_epoch,
+        global_samples_per_step=global_samples_per_step,
+        samples_per_epoch=samples_per_epoch,
+        source_equivalent_epochs=source_equivalent_epochs,
+        extra_epochs=max(0, total_epochs - source_equivalent_epochs),
+        total_epochs=total_epochs,
+        source_equivalent_steps=source_equivalent_epochs * steps_per_epoch,
+        total_steps=total_epochs * steps_per_epoch,
+    )
+
+
+def init_logger(cfg, subdir: str = "contrast"):
+    rank = int(os.environ.get("RANK", 0))
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        f"[%(asctime)s] [rank: {rank}] [%(levelname)s] - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handlers: list[logging.Handler] = []
+    if rank == 0:
+        log_path = Path(cfg.log_dir) / f"{subdir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path))
+        handlers.append(logging.StreamHandler())
+    else:
+        # The other ranks say the same things at the same time; keep only what signals
+        # trouble, otherwise every message is repeated once per GPU.
+        console = logging.StreamHandler()
+        console.setLevel(logging.WARNING)
+        handlers.append(console)
+    for h in handlers:
+        h.setFormatter(formatter)
+
+    # The library modules log the things worth auditing -- resolved temporal windows,
+    # skipped datasets, canonical-space fallbacks -- but only `__main__` was ever given a
+    # handler, so those records fell through to logging's lastResort handler and anything
+    # below WARNING was silently dropped. Configure the `lerobot` logger too, rather than
+    # the root, which would pull in INFO spam from torch/deepspeed/PIL.
+    lib_logger = logging.getLogger("lerobot")
+    lib_logger.setLevel(logging.INFO)
+    for target in (logger, lib_logger):
+        for h in handlers:
+            target.addHandler(h)
+        # `cfg.validate()` reaches for the module-level `logging.warning`, which quietly runs
+        # `basicConfig()` and leaves a handler on the root logger. Records propagating up
+        # would then be emitted a second time in logging's default format. Terminate here:
+        # these two loggers already have handlers of their own.
+        target.propagate = False
+    return logger
+
+
+def _worker_init(_worker_id: int) -> None:
+    """One thread per worker.
+
+    Decoding and resizing are already parallelised across workers; letting each of them
+    spawn its own intra-op thread pool oversubscribes the CPU and measurably *lowers*
+    throughput once several ranks share the machine.
+    """
+    torch.set_num_threads(1)
+
+
+def move_batch(batch: dict, device, dtype=torch.bfloat16) -> dict:
+    """Move a batch to ``device``, casting *only* floating point tensors to ``dtype``."""
+    out = {}
+    for key, value in batch.items():
+        if not isinstance(value, torch.Tensor):
+            out[key] = value
+            continue
+        value = value.to(device, non_blocking=True)
+        if value.is_floating_point() and key not in _KEEP_DTYPE_KEYS:
+            value = value.to(dtype)
+        out[key] = value
+    return out
+
+
+def _data_read_batch_counts(
+    batch: dict[str, Any],
+    num_datasets: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-dataset fallback and sample counts from one collated CPU batch."""
+    dataset_ids = batch["dataset_id"].detach().to(device="cpu", dtype=torch.long).reshape(-1)
+    fallback = batch.get("data_read_fallback")
+    if fallback is None:
+        fallback_mask = torch.zeros_like(dataset_ids, dtype=torch.bool)
+    else:
+        fallback_mask = fallback.detach().to(device="cpu").reshape(-1) > 0.5
+    if fallback_mask.numel() != dataset_ids.numel():
+        raise ValueError(
+            "`data_read_fallback` and `dataset_id` must contain the same number of rows."
+        )
+    sample_counts = torch.bincount(dataset_ids, minlength=num_datasets)
+    fallback_counts = torch.bincount(
+        dataset_ids[fallback_mask],
+        minlength=num_datasets,
+    )
+    return fallback_counts, sample_counts
+
+
+def update_policy(model_engine, batch: Any, task_type: str, step: int):
+    batch = move_batch(batch, model_engine.device)
+    loss, output_dict = model_engine(batch, task_type=task_type, step=step)
+    model_engine.backward(loss)
+    model_engine.step()
+    return loss, output_dict
+
+
+def _load_stage2_resume_policy_config(
+    cfg: TrainPipelineConfig,
+    args: Sequence[str] | None = None,
+) -> None:
+    if not cfg.weight_resume or cfg.policy.type != "qwen3vl_mot":
+        return
+    runtime_policy = cfg.policy
+    task_names_overridden = parser.parse_arg("policy.task_names", args) is not None
+    task_weights_overridden = parser.parse_arg("policy.task_weights", args) is not None
+    rgb_views_overridden = parser.parse_arg("policy.rgb_views", args) is not None
+    physical_flow_overridden = parser.parse_arg("policy.physical_flow_space", args) is not None
+    generation_backbone_overridden = parser.parse_arg("policy.generation_backbone", args) is not None
+    generation_tuning_overridden = parser.parse_arg("policy.generation_tuning_mode", args) is not None
+    checkpoint_root = Path(cfg.output_dir)
+    config_path = checkpoint_root / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Cannot resume qwen3vl_mot: {config_path} is missing. Start a fresh run with "
+            "`weight_resume=false` and a valid stage-one checkpoint."
+        )
+    with config_path.open(encoding="utf-8") as handle:
+        saved_task_config = json.load(handle)
+    from lerobot.common.policies.qwen3vl_mot.tasks import validate_saved_task_contract
+
+    validate_saved_task_contract(saved_task_config)
+    saved_policy = PreTrainedConfig.from_pretrained(checkpoint_root)
+    if saved_policy.type != "qwen3vl_mot":
+        raise ValueError(
+            f"Expected a qwen3vl_mot config in {config_path}, got {saved_policy.type!r}."
+        )
+    if saved_policy.stage1_policy_config is None:
+        raise ValueError(
+            "The saved stage-two config does not embed its stage-one architecture. Resume "
+            "this older checkpoint with the original stage-one checkpoint available."
+        )
+    for field_name in ("qwen3vl_dir", "cosmos3_dir"):
+        runtime_path = getattr(runtime_policy, field_name)
+        if runtime_path:
+            setattr(saved_policy, field_name, runtime_path)
+    if parser.parse_arg("policy.generation_pretrained_dir", args) is not None:
+        saved_policy.generation_pretrained_dir = runtime_policy.generation_pretrained_dir
+    for name, overridden in (
+        ("generation_backbone", generation_backbone_overridden),
+        ("generation_tuning_mode", generation_tuning_overridden),
+    ):
+        if overridden and getattr(runtime_policy, name) != getattr(saved_policy, name):
+            raise ValueError(
+                f"Cannot change `policy.{name}` while resuming: generation weights, "
+                "adapters and optimizer states have a different contract. Start a fresh output directory."
+            )
+    if task_names_overridden and tuple(runtime_policy.task_names) != tuple(saved_policy.task_names):
+        raise ValueError(
+            "Cannot change `policy.task_names` while resuming because it changes the "
+            "Generation Expert task embedding contract. Start a fresh output directory, "
+            "or keep the original task list and set inactive task weights to zero."
+        )
+    if task_weights_overridden:
+        task_names = tuple(saved_policy.task_names)
+        task_weights = tuple(runtime_policy.task_weights)
+        resolve_task_specs(task_names, task_weights)
+        saved_policy.task_weights = task_weights
+    if rgb_views_overridden and tuple(runtime_policy.rgb_views) != tuple(saved_policy.rgb_views):
+        raise ValueError(
+            "Cannot change `policy.rgb_views` while resuming: camera embeddings and video "
+            "supervision must keep the same view contract. Start a fresh output directory."
+        )
+    if physical_flow_overridden and runtime_policy.physical_flow_space != saved_policy.physical_flow_space:
+        raise ValueError(
+            "Cannot change `policy.physical_flow_space` while resuming: flow heads, decoders, "
+            "and optimizer states have different contracts. Start a fresh output directory."
+        )
+    for name in (
+        "action_prediction_reconstruction_loss_weight",
+        "state_prediction_reconstruction_loss_weight",
+        "time_sampling_distribution",
+        "time_sampling_shift",
+        "time_sampling_beta_alpha",
+        "time_sampling_beta_beta",
+        "time_sampling_beta_probability",
+    ):
+        if parser.parse_arg(f"policy.{name}", args) is not None:
+            setattr(saved_policy, name, getattr(runtime_policy, name))
+    saved_policy.validate_features()
+    saved_policy.initialize_from_stage1 = False
+    cfg.policy = saved_policy
+    if cfg.use_policy_training_preset:
+        cfg.optimizer = saved_policy.get_optimizer_preset()
+        cfg.scheduler = saved_policy.get_scheduler_preset()
+
+
+@parser.wrap()
+def train(cfg: ContrastiveTrainPipelineConfig):
+    cfg.validate()
+    _load_stage2_resume_policy_config(cfg)
+    if cfg.policy.type == "qwen3vl_mot":
+        cfg.stage = resolve_stage2_training_stage(cfg.stage, cfg.data_mix)
+
+    os.environ.setdefault("DECORD_LOG_LEVEL", "error")
+    deepspeed.init_distributed()
+    logger = init_logger(cfg, subdir="qwen3vl_mot" if cfg.policy.type == "qwen3vl_mot" else "contrast")
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_stage2 = cfg.policy.type == "qwen3vl_mot"
+
+    if rank == 0:
+        logger.info(pformat(cfg.to_dict()))
+        wandb_logger = WandBLogger(cfg) if (cfg.wandb.enable and cfg.wandb.project) else None
+        if wandb_logger is None:
+            logger.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
+    else:
+        wandb_logger = None
+
+    if cfg.seed is not None:
+        set_seed(cfg.seed + rank)
+
+    with open(cfg.deepspeed) as f:
+        deepspeed_configs_in_dict = json.load(f)
+    batch_size = deepspeed_configs_in_dict["train_micro_batch_size_per_gpu"]
+
+    # ------------------------------------------------------------------ data
+    # The seed is shared across ranks: every process reconstructs the same virtual global
+    # batch before deterministically taking its balanced local shard.
+    dataset = MultiModalContrastiveDataset(
+        cfg=cfg,
+        data_mix=cfg.data_mix,
+        seed=cfg.seed,
+        dataset_size_one_epoch=cfg.dataset.dataset_size_one_epoch,
+    )
+    logger.info(f"Dataset: {dataset}")
+    if cfg.policy.type == "robo_contrast" and not dataset.has_physical.any():
+        if (
+            cfg.policy.perception_recon_weight <= 0
+            or cfg.policy.num_predictor_layers <= 0
+        ):
+            raise ValueError(
+                "The selected mixture contains only video, so train_contrastive needs "
+                "perception_recon_weight > 0 and num_predictor_layers > 0."
+            )
+        cfg.policy.perception_only = True
+        logger.warning(
+            "The mixture contains no physical supervision. PhysicalEncoder will not be "
+            "built; train_contrastive will optimize only the visual-change latent "
+            "reconstruction objective."
+        )
+
+    sampler = _make_training_sampler(cfg, dataset, batch_size, world_size, rank)
+    epoch_schedule = _compute_epoch_schedule(
+        total_source_frames=dataset.total_pool_anchors,
+        steps_per_epoch=len(sampler),
+        global_samples_per_step=batch_size * world_size,
+        max_epochs=cfg.max_epochs,
+    )
+    if rank == 0:
+        logger.info(
+            "Epoch schedule: source_frames=%s pool_anchors=%s configured_samples_per_epoch=%s "
+            "actual_samples_per_epoch=%s steps_per_epoch=%s "
+            "source_equivalent_epochs=%s extra_epochs=%s total_epochs=%s max_epochs=%s "
+            "source_equivalent_steps=%s total_steps=%s pool=%s; cfg.steps=%s is ignored",
+            format_big_number(dataset.total_source_frames),
+            format_big_number(dataset.total_pool_anchors),
+            format_big_number(cfg.dataset.dataset_size_one_epoch),
+            format_big_number(epoch_schedule.samples_per_epoch),
+            format_big_number(epoch_schedule.steps_per_epoch),
+            format_big_number(epoch_schedule.source_equivalent_epochs),
+            format_big_number(epoch_schedule.extra_epochs),
+            format_big_number(epoch_schedule.total_epochs),
+            cfg.max_epochs,
+            format_big_number(epoch_schedule.source_equivalent_steps),
+            format_big_number(epoch_schedule.total_steps),
+            dataset.sample_pool_fingerprint,
+            format_big_number(cfg.steps),
+        )
+
+    dataloader = DataLoader(
+        dataset=dataset,
+        batch_sampler=sampler,
+        num_workers=cfg.num_workers,
+        worker_init_fn=_worker_init,
+        pin_memory=True,
+        collate_fn=contrastive_collate_fn,
+        persistent_workers=cfg.num_workers > 0,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
+    )
+
+    # A fixed set of frames, identical in every run, scored periodically. In-batch retrieval
+    # accuracy on random training batches is too noisy to compare runs with -- see
+    # ``contrastive_eval`` for the measurement -- so this is the number to judge a change on.
+    eval_loaders = None
+    if cfg.policy.type == "robo_contrast":
+        eval_loaders = build_eval_loaders(
+            dataset=dataset,
+            policy_cfg=cfg.policy,
+            collate_fn=contrastive_collate_fn,
+            num_workers=max(2, cfg.num_workers // 2),
+            rank=rank,
+            world_size=world_size,
+        )
+
+    # ------------------------------------------------------------------ policy
+    logger.info("Creating policy...")
+    policy = make_policy(
+        cfg=cfg.policy,
+        device="cpu",
+        ds_meta=dataset.meta,
+        weight_pt_path=cfg.policy.pretrained_path,
+    )
+
+    optimizer, lr_scheduler = make_optimizer_and_scheduler(
+        cfg,
+        policy,
+        num_training_steps=epoch_schedule.total_steps,
+    )
+    optimizer_signature = optimizer_group_signature(policy, optimizer)
+
+    # Cast weights to bf16 without changing the configured frozen/LoRA/full trainability.
+    for params in policy.parameters():
+        params.data = params.data.bfloat16()
+
+    if rank == 0:
+        num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        num_total_params = sum(p.numel() for p in policy.parameters())
+        logger.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+        logger.info(
+            "Training epochs: source-equivalent=%s extra=%s total=%s max_epochs=%s; total steps: %s",
+            format_big_number(epoch_schedule.source_equivalent_epochs),
+            format_big_number(epoch_schedule.extra_epochs),
+            format_big_number(epoch_schedule.total_epochs),
+            cfg.max_epochs,
+            format_big_number(epoch_schedule.total_steps),
+        )
+        logger.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
+        logger.info(f"{dataset.num_episodes=}")
+        logger.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
+        logger.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+
+    model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
+        model=policy,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        config=cfg.deepspeed,
+        model_parameters=[p for p in policy.parameters() if p.requires_grad],
+    )
+    model_engine.train()
+    logger.info(f"Training batch size: {model_engine.train_batch_size()}")
+    logger.info(
+        "Optimizer learning rates: %s",
+        ", ".join(
+            f"{group.get('group_name', f'group_{index}')}={group['lr']:.3e}"
+            for index, group in enumerate(optimizer.param_groups)
+        ),
+    )
+
+    step = 0
+    if not is_stage2:
+        cfg.output_dir = os.path.join(cfg.output_dir, cfg.job_name)
+    if rank == 0:
+        output_path = Path(cfg.output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        cfg.policy._save_pretrained(output_path)
+    if dist.is_initialized():
+        dist.barrier()
+    if cfg.weight_resume:
+        logger.info(f"Resuming training from {cfg.output_dir}")
+        load_path, loaded_state, optimizer_restored = load_checkpoint_with_optimizer_fallback(
+            model_engine,
+            cfg.output_dir,
+            optimizer_signature,
+            world_size,
+            lr_scheduler,
+        )
+        if is_stage2 and (load_path is None or loaded_state is None):
+            raise FileNotFoundError(
+                f"`weight_resume=true` was requested, but no DeepSpeed checkpoint exists in "
+                f"{cfg.output_dir}. Start a fresh run with `weight_resume=false` and a valid "
+                "stage-one checkpoint."
+            )
+        if load_path is not None and loaded_state is not None:
+            # load_checkpoint returns every non-DeepSpeed-owned key it finds in the
+            # checkpoint, which includes internal metadata such as
+            # `checkpoint_parallel_dimensions` that newer DeepSpeed writes on save but
+            # does not filter out on load. Feeding that dict back into save_checkpoint
+            # raises "client_state contains reserved checkpoint key", so only pick out
+            # the fields this script actually owns.
+            validate_sample_pool_resume(dataset.sample_pool, loaded_state)
+            _validate_training_sampler_resume(sampler, loaded_state)
+            step = loaded_state.get("step", 0)
+            if not optimizer_restored:
+                align_fresh_scheduler_to_step(
+                    lr_scheduler,
+                    step,
+                    model_engine.gradient_accumulation_steps(),
+                )
+            logger.info(f"Resumed training from step {step}")
+
+    if is_stage2:
+        train_metrics = {
+            "loss": AverageMeter("loss", ":.3f"),
+            "latent_action_loss": AverageMeter("latent", ":.4f"),
+            "video_flow_loss": AverageMeter("video", ":.4f"),
+            "action_flow_loss": AverageMeter("action", ":.4f"),
+            "action_prediction_reconstruction_loss": AverageMeter("action_pred", ":.4f"),
+            "state_prediction_reconstruction_loss": AverageMeter("state_pred", ":.4f"),
+            "state_flow_loss": AverageMeter("state", ":.4f"),
+            "tactile_flow_loss": AverageMeter("tactile", ":.4f"),
+            "valid_rows": AverageMeter("valid", ":.1f"),
+            **{
+                f"task_{name}": AverageMeter(name, ":.2f")
+                for name in cfg.policy.task_names
+            },
+            "lr": AverageMeter("lr", ":0.1e"),
+            "understanding_lr": AverageMeter("ulr", ":0.1e"),
+            "physical_lr": AverageMeter("plr", ":0.1e"),
+            "update_s": AverageMeter("updt_s", ":.3f"),
+            "dataloading_s": AverageMeter("data_s", ":.3f"),
+        }
+    else:
+        train_metrics = {
+            "loss": AverageMeter("loss", ":.3f"),
+            "contrastive_loss": AverageMeter("contra_loss", ":.3f"),
+            "recon_loss": AverageMeter("trecon", ":.4f"),
+            "percep_recon_loss": AverageMeter("precon", ":.4f"),
+            "retrieval_acc": AverageMeter("acc", ":.3f"),
+            "physical_rows": AverageMeter("phys_n", ":.1f"),
+            "video_only_rows": AverageMeter("video_n", ":.1f"),
+            "tactile_hits": AverageMeter("tac_hit", ":.1f"),
+            "tactile_rows": AverageMeter("tac_n", ":.1f"),
+            "pos_sim": AverageMeter("pos_sim", ":.3f"),
+            "logit_scale": AverageMeter("scale", ":.2f"),
+            "tac_sig_gate": AverageMeter("tsig", ":.3f"),
+            "tac_img_gate": AverageMeter("timg", ":.3f"),
+            "lr": AverageMeter("lr", ":0.1e"),
+            "vision_lr": AverageMeter("vlr", ":0.1e"),
+            "update_s": AverageMeter("updt_s", ":.3f"),
+            "dataloading_s": AverageMeter("data_s", ":.3f"),
+        }
+    train_tracker = MetricsTracker(
+        model_engine.train_batch_size(),
+        dataset.num_frames,
+        dataset.num_episodes,
+        train_metrics,
+        initial_step=int(step / model_engine.gradient_accumulation_steps()),
+    )
+
+    logger.info(f"Start training on {world_size} devices")
+    fwd_bwd_time = 0.0
+    dataloading_s = 0.0
+    interval_read_fallbacks = torch.zeros(len(dataset.dataset_names), dtype=torch.long)
+    interval_read_samples = torch.zeros(len(dataset.dataset_names), dtype=torch.long)
+    total_read_fallbacks = 0
+    total_read_samples = 0
+    dist_step = 50
+    start_epoch, start_batch = divmod(step, epoch_schedule.steps_per_epoch)
+    if step:
+        if start_epoch < epoch_schedule.total_epochs:
+            logger.info(
+                "Resume position: epoch %d/%d, batch %d/%d",
+                start_epoch + 1,
+                epoch_schedule.total_epochs,
+                start_batch,
+                epoch_schedule.steps_per_epoch,
+            )
+        else:
+            logger.info(
+                "Checkpoint step %s has already reached planned total step %s.",
+                format_big_number(step),
+                format_big_number(epoch_schedule.total_steps),
+            )
+
+    for epoch in range(start_epoch, epoch_schedule.total_epochs):
+        epoch_start_batch = start_batch if epoch == start_epoch else 0
+        logger.info(
+            "Epoch %d/%d start at batch %d/%d (step %s/%s)",
+            epoch + 1,
+            epoch_schedule.total_epochs,
+            epoch_start_batch,
+            epoch_schedule.steps_per_epoch,
+            format_big_number(step),
+            format_big_number(epoch_schedule.total_steps),
+        )
+        sampler.set_epoch(epoch)
+        sampler.set_start_batch(epoch_start_batch)
+        dataset.set_epoch(epoch)
+        batch_ready = time.perf_counter()
+        for batch_offset, batch in enumerate(dataloader):
+            batch_idx = epoch_start_batch + batch_offset
+            dataloading_s += time.perf_counter() - batch_ready
+            batch_fallbacks, batch_samples = _data_read_batch_counts(
+                batch,
+                len(dataset.dataset_names),
+            )
+            interval_read_fallbacks += batch_fallbacks
+            interval_read_samples += batch_samples
+            if step == 0:
+                dataset_ids, dataset_counts = torch.unique(
+                    batch["dataset_id"],
+                    return_counts=True,
+                )
+                mix = ", ".join(
+                    f"{dataset.dataset_names[int(dataset_id)]}:{int(count)}"
+                    for dataset_id, count in zip(dataset_ids, dataset_counts, strict=True)
+                )
+                logger.warning(
+                    "First batch rank=%d physical=%d video_only=%d tactile_pads=%d "
+                    "datasets={%s}",
+                    rank,
+                    int(batch["has_physical"].sum().item()),
+                    int((batch["has_physical"] < 0.5).sum().item()),
+                    int(batch["tactile_image_mask"].sum().item()),
+                    mix,
+                )
+
+            fwd_bwd_start = time.perf_counter()
+            task_type = cfg.task_type
+            if cfg.policy.type == "qwen3vl_mot" and task_type == "train_contrastive":
+                task_type = "train_stage2"
+            loss, output_dict = update_policy(model_engine, batch, task_type, step=step)
+            step += 1
+            fwd_bwd_time += time.perf_counter() - fwd_bwd_start
+
+            if model_engine.is_gradient_accumulation_boundary():
+                train_tracker.dataloading_s = dataloading_s
+                train_tracker.update_s = fwd_bwd_time
+                train_tracker.loss = loss.detach().mean().item()
+                train_tracker.lr = optimizer.param_groups[0]["lr"]
+                if is_stage2:
+                    for key in train_metrics:
+                        if key in output_dict:
+                            setattr(train_tracker, key, output_dict[key])
+                    train_tracker.understanding_lr = next(
+                        (
+                            group["lr"]
+                            for group in optimizer.param_groups
+                            if group.get("group_name") == "understanding"
+                        ),
+                        0.0,
+                    )
+                    train_tracker.physical_lr = next(
+                        (
+                            group["lr"]
+                            for group in optimizer.param_groups
+                            if group.get("group_name") == "physical"
+                        ),
+                        0.0,
+                    )
+                else:
+                    train_tracker.recon_loss = output_dict.get("recon_loss", 0.0)
+                    train_tracker.percep_recon_loss = output_dict.get("percep_recon_loss", 0.0)
+                    physical_rows = output_dict.get("physical_rows", 0.0)
+                    if physical_rows > 0:
+                        train_tracker.contrastive_loss.update(
+                            output_dict.get("contrastive_loss", 0.0),
+                            n=physical_rows,
+                        )
+                        train_tracker.retrieval_acc.update(
+                            output_dict.get("retrieval_acc", 0.0),
+                            n=physical_rows,
+                        )
+                        train_tracker.pos_sim.update(
+                            output_dict.get("pos_sim", 0.0),
+                            n=physical_rows,
+                        )
+                    train_tracker.physical_rows = physical_rows
+                    train_tracker.video_only_rows = output_dict.get("video_only_rows", 0.0)
+                    train_tracker.tactile_hits = output_dict.get("tactile_hits", 0.0)
+                    train_tracker.tactile_rows = output_dict.get("tactile_rows", 0.0)
+                    train_tracker.logit_scale = output_dict.get("logit_scale", 0.0)
+                    train_tracker.tac_sig_gate = output_dict.get("tactile_sig_gate", 0.0)
+                    train_tracker.tac_img_gate = output_dict.get("tactile_img_gate", 0.0)
+                    train_tracker.vision_lr = next(
+                        (
+                            group["lr"]
+                            for group in optimizer.param_groups
+                            if group.get("group_name") == "vision"
+                        ),
+                        0.0,
+                    )
+                train_tracker.step()
+                fwd_bwd_time = 0.0
+                dataloading_s = 0.0
+
+            if eval_loaders and cfg.eval_freq > 0 and step % cfg.eval_freq == 0:
+                eval_start = time.perf_counter()
+                eval_metrics = evaluate(model_engine, eval_loaders, move_batch)
+                if rank == 0:
+                    summary = " ".join(
+                        f"{k.split('/')[-1]}:{v:.4f}"
+                        for k, v in eval_metrics.items()
+                        if not k.endswith("_rows")
+                    )
+                    logger.info(
+                        f"eval step:{step} {summary} took:{time.perf_counter() - eval_start:.1f}s"
+                    )
+                    if wandb_logger:
+                        wandb_logger.log_dict(eval_metrics, step)
+
+            is_last_batch = (
+                epoch + 1 == epoch_schedule.total_epochs
+                and batch_idx + 1 == epoch_schedule.steps_per_epoch
+            )
+            if cfg.save_checkpoint and (step % cfg.save_freq == 0 or is_last_batch):
+                logger.info(f"Checkpoint policy after step {step}")
+                os.makedirs(cfg.output_dir, exist_ok=True)
+                client_state = {
+                    "step": step,
+                    "epoch": epoch,
+                    "batch_in_epoch": batch_idx + 1,
+                    OPTIMIZER_GROUP_SIGNATURE_KEY: optimizer_signature,
+                    DATA_PARALLEL_WORLD_SIZE_KEY: world_size,
+                    **sample_pool_checkpoint_state(dataset.sample_pool),
+                    **_training_sampler_checkpoint_state(sampler),
+                }
+                model_engine.save_checkpoint(
+                    save_dir=cfg.output_dir,
+                    client_state=client_state,
+                )
+
+            should_log = cfg.log_freq > 0 and step % cfg.log_freq == 0
+            read_stats = None
+            if should_log:
+                read_stats = torch.cat(
+                    [interval_read_fallbacks, interval_read_samples]
+                ).to(model_engine.device)
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(read_stats, op=dist.ReduceOp.SUM)
+                interval_read_fallbacks.zero_()
+                interval_read_samples.zero_()
+
+            if rank == 0 and should_log:
+                num_datasets = len(dataset.dataset_names)
+                global_fallbacks = read_stats[:num_datasets].cpu()
+                global_samples = read_stats[num_datasets:].cpu()
+                interval_fallback_count = int(global_fallbacks.sum().item())
+                interval_sample_count = int(global_samples.sum().item())
+                interval_fallback_rate = interval_fallback_count / max(
+                    1,
+                    interval_sample_count,
+                )
+                total_read_fallbacks += interval_fallback_count
+                total_read_samples += interval_sample_count
+                total_fallback_rate = total_read_fallbacks / max(1, total_read_samples)
+
+                logger.info(
+                    "epoch:%d/%d %s",
+                    epoch + 1,
+                    epoch_schedule.total_epochs,
+                    train_tracker,
+                )
+                failed_datasets = {
+                    dataset.dataset_names[index]: int(global_fallbacks[index].item())
+                    for index in range(num_datasets)
+                    if global_fallbacks[index].item() > 0
+                }
+                if failed_datasets:
+                    logger.warning(
+                        "Data read fallbacks over the last %d samples: %d (%.4f%%), "
+                        "total=%d; by_dataset=%s",
+                        interval_sample_count,
+                        interval_fallback_count,
+                        100.0 * interval_fallback_rate,
+                        total_read_fallbacks,
+                        failed_datasets,
+                    )
+                if wandb_logger:
+                    wandb_log_dict = train_tracker.to_dict()
+                    wandb_log_dict["sampler_epoch/current"] = epoch + 1
+                    wandb_log_dict["sampler_epoch/total"] = epoch_schedule.total_epochs
+                    wandb_log_dict["data/read_fallback_count_interval"] = (
+                        interval_fallback_count
+                    )
+                    wandb_log_dict["data/read_fallback_rate_interval"] = (
+                        interval_fallback_rate
+                    )
+                    wandb_log_dict["data/read_fallback_count_total"] = (
+                        total_read_fallbacks
+                    )
+                    wandb_log_dict["data/read_fallback_rate_total"] = total_fallback_rate
+                    for index, name in enumerate(dataset.dataset_names):
+                        fallback_count = int(global_fallbacks[index].item())
+                        if fallback_count == 0:
+                            continue
+                        sample_count = int(global_samples[index].item())
+                        wandb_log_dict[
+                            f"data/read_fallback_count_by_dataset/{name}"
+                        ] = fallback_count
+                        wandb_log_dict[
+                            f"data/read_fallback_rate_by_dataset/{name}"
+                        ] = fallback_count / max(1, sample_count)
+                    if output_dict:
+                        for key, value in output_dict.items():
+                            wandb_log_dict.setdefault(key, value)
+                    wandb_logger.log_dict(wandb_log_dict, step)
+                train_tracker.reset_averages()
+
+            if step % dist_step == 0 and dist.is_initialized():
+                dist.barrier(device_ids=[model_engine.local_rank])
+
+            batch_ready = time.perf_counter()
+
+    logger.info("Training finished")
+
+
+if __name__ == "__main__":
+    train()

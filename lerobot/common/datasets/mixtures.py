@@ -1,0 +1,875 @@
+"""
+mixtures.py
+
+Defines a registry of dataset mixtures and weights for the Open-X Embodiment Datasets. Each dataset is associated with
+a float "sampling weight"
+"""
+
+from collections.abc import Iterable
+from typing import Dict, List, Tuple
+
+
+def expand_dataset_names(names: Iterable[str]) -> tuple[str, ...]:
+    """Accept individual dataset names or named mixtures without duplicating members."""
+    expanded = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        members = OXE_NAMED_MIXTURES.get(name, [(name, 1.0)])
+        expanded.extend(dataset for dataset, weight in members if weight > 0)
+    return tuple(dict.fromkeys(expanded))
+
+
+def resolve_stage2_training_stage(stage: str, data_mix: str) -> str:
+    if stage not in ("auto", "pretrain", "finetune"):
+        raise ValueError("Stage 2 stage must be auto, pretrain or finetune.")
+    if stage != "auto":
+        return stage
+    members = expand_dataset_names((data_mix,))
+    return "finetune" if members and all(name.startswith("libero_") for name in members) else "pretrain"
+
+
+# fmt: off
+OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
+    # === Bridge V2 Dataset ===
+    "bridge": [
+        # ("bridge_oxe", 1.0),                                    # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+    ],
+
+
+    # === [Moderate-Scale] Bridge++ Mixtures ===
+    "bridge_rt_1": [
+        # ("bridge_oxe", 1.0)                                   # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+
+        ("fractal20220817_data", 1.0),                          # Google RT-1 Robot Data (Large-Scale)
+    ],
+
+    # === RT-X Mixtures ===
+    "rtx": [
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        # ("bridge_oxe", 1.0)                                   # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 2.0),
+        ("berkeley_cable_routing", 3.0),
+        ("roboturk", 1.0),
+        # ("nyu_door_opening_surprising_effectiveness", 5.0),   # Note --> only contains wrist camera images (skip?)
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 1.0),
+        ("toto", 1.0),
+    ],
+
+    "rtx_franka": [
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        # ("bridge_oxe", 1.0)                                   # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 2.0),
+        ("berkeley_cable_routing", 3.0),
+        ("roboturk", 1.0),
+        # ("nyu_door_opening_surprising_effectiveness", 5.0),   # Note --> only contains wrist camera images (skip?)
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 1.0),
+        ("toto", 1.0),
+
+        ("taco_play", 1.0),
+        ("berkeley_cable_routing", 1.0),
+        ("viola", 1.0),
+        ("toto", 1.0),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 3.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("maniskill_dataset_converted_externally_to_rlds", 0.1),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("cmu_franka_exploration_dataset_converted_externally_to_rlds", 5.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("berkeley_rpt_converted_externally_to_rlds", 1.0),
+        ("kaist_nonprehensile_converted_externally_to_rlds", 3.0),
+        ("stanford_robocook_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        ("cmu_play_fusion", 1.0),
+    ],
+
+    # === Open-X Magic Soup ===
+    "oxe_magic_soup": [
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        # ("bridge_oxe", 1.0)                                   # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("berkeley_cable_routing", 1.0),
+        ("roboturk", 2.0),
+        # ("nyu_door_opening_surprising_effectiveness", 1.0),   # Note --> only contains wrist camera images (skip?)
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        # ("bc_z", 0.2),                                        # Note --> raw data is broken!
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        # ("uiuc_d3field", 1.0),                                # Note --> raw data is broken!
+        ("utaustin_mutex", 1.0),
+        ("berkeley_fanuc_manipulation", 2.0),
+        ("cmu_stretch", 1.0),
+    ],
+
+    # === Open-X Magic Soup++ ===
+    "oxe_magic_soup_plus": [
+        ("berkeley_cable_routing", 1.0),
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 2.0),
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        ("berkeley_fanuc_manipulation", 2.0),
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.2),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 1.0),
+        ("dobbe", 0.2),
+        ("droid", 0.001),
+        ("rh20t", 0.1),
+        ("agibot_alpha", 0.1),
+        ("ego_dex_split5", 0.08),
+        ("ego_dex_split3", 0.08),
+        ("game_minecraft", 1.0),
+        ("game_stardew", 1.0),
+        ("game_csgo", 1.0),
+    ],
+
+    "oxe_magic_soup_plus_minus_v1": [
+        ("berkeley_cable_routing", 1.0),
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 2.0),
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        ("berkeley_fanuc_manipulation", 2.0),
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.2),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 1.0),
+        ("dobbe", 0.2),
+        ("droid", 0.001),
+        # ("agibot_alpha", 0.1),
+        # ("ego_dex_split5", 0.08),
+        # ("ego_dex_split3", 0.08),
+        # ("game_minecraft", 1.0),
+        # ("game_stardew", 1.0),
+        # ("game_csgo", 1.0),
+    ],
+
+    "oxe_magic_soup_plus_minus_v2": [
+        ("berkeley_cable_routing", 1.0),
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 2.0),
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        ("berkeley_fanuc_manipulation", 2.0),
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.2),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 1.0),
+        ("dobbe", 0.2),
+        ("game_minecraft", 1.0),
+        ("game_stardew", 1.0),
+        ("game_csgo", 1.0),
+        # ("ego_dex", 0.005),
+    ],
+
+    "oxe_magic_soup_plus_minus": [
+        ("fractal20220817_data", 1.0),                          # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("berkeley_cable_routing", 1.0),
+        ("roboturk", 2.0),
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        # ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        ("berkeley_fanuc_manipulation", 2.0),
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.2),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 1.0),
+        ("dobbe", 0.2),
+        # ("droid", 0.06),
+    ],
+    "ego":[
+        ("ego_dex_split2", 0.08),
+        ("ego_dex_split5", 0.08),
+        ("ego_dex_split3", 0.08),
+    ],
+    
+    "ms_complete_data":[
+        ("berkeley_cable_routing", 1.0),
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 2.0),
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        # ("austin_buds_dataset_converted_externally_to_rlds", 1.0), # state is not quant or rpy
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        # ("berkeley_fanuc_manipulation", 2.0), # state is not quant or rpy
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.2),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 1.0),
+        ("dobbe", 0.2),
+        ("droid", 0.01),
+        ("agibot_alpha", 0.1),
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.0),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+        # ("interna1_dual_arm_0", 0.05),
+        ("interna1_dual_arm_1", 0.05),
+        # ("interna1_dual_arm_2", 0.05),
+        ("interna1_dual_arm_3", 0.05),
+        ("interna1_dual_arm_4", 0.1),
+        # ("interna1_single_arm", 0.1),
+    ],
+    
+    "ms_complete_data_franka":[
+        # ("berkeley_cable_routing", 0.1),
+        ("fractal20220817_data", 1.0),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.5),
+        ("bridge_orig", 0.5),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 1.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 1.0),
+        # ("viola", 1.0),
+        ("berkeley_autolab_ur5", 1.0),
+        # ("toto", 1.0),
+        # ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 1.0),
+        # ("austin_buds_dataset_converted_externally_to_rlds", 1.0), # state is not quant or rpy
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 1.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.5),
+        # ("ucsd_kitchen_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        # ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        # ("utaustin_mutex", 0.3),
+        # ("berkeley_fanuc_manipulation", 2.0), # state is not quant or rpy
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.3),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 0.3),
+        ("dobbe", 0.3),
+        # ("droid", 0.01),
+        ("agibot_alpha", 0.1),
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.5),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+        # ("interna1_dual_arm_0", 0.05),
+        # ("interna1_dual_arm_1", 0.05),
+        # ("interna1_dual_arm_2", 0.05),
+        # ("interna1_dual_arm_3", 0.05),
+        # ("interna1_dual_arm_4", 0.1),
+        ("interna1_single_arm", 0.15),
+        # ms_buy_data
+        ("ms_data_scale", 0.2),
+        ("ms_data_xdof_1", 0.1),
+        ("ms_data_xdof_2", 0.1),
+        ("ms_data_xdof_3", 0.15),
+        ("ms_data_xdof_4", 0.15),
+        # ("ms_data_xdof_5", 0.1),
+    ],
+    
+    "ms_buy_v30":[
+        # ("ms_data_scale", 1.0),
+        # ("ms_data_xdof_1", 0.15),
+        # ("ms_data_xdof_2", 0.15),
+        ("ms_data_xdof_3", 0.15),
+        # ("ms_data_xdof_4", 0.15),
+        # ("ms_data_xdof_5", 0.15),
+    ],
+    
+    "ms_complete_data_wo_sim":[
+        ("berkeley_cable_routing", 1.0),
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.8341046294),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 2.0),
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        # ("austin_buds_dataset_converted_externally_to_rlds", 1.0), # state is not quant or rpy
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        ("utaustin_mutex", 1.0),
+        # ("berkeley_fanuc_manipulation", 2.0), # state is not quant or rpy
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.2),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 1.0),
+        ("dobbe", 0.2),
+        ("droid", 0.01),
+        ("agibot_alpha", 0.1),
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.0),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+    ],
+    "robomind":[
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.0),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+    ],
+    "interna1":[
+        # ("interna1_dual_arm_0", 0.05),
+        # ("interna1_dual_arm_1", 0.5),
+        # ("interna1_dual_arm_2", 0.5),
+        # ("interna1_dual_arm_3", 0.5),
+        # ("interna1_dual_arm_4", 0.5),
+        ("interna1_single_arm", 0.5),
+    ],
+    "interna1_single":[
+        # ("interna1_dual_arm_0", 0.05),
+        # ("interna1_dual_arm_1", 0.5),
+        # ("interna1_dual_arm_2", 0.5),
+        # ("interna1_dual_arm_3", 0.5),
+        # ("interna1_dual_arm_4", 0.5),
+        ("interna1_single_arm", 0.5),
+    ],
+    "interna1_dual":[
+        ("interna1_dual_arm_0", 0.05),
+        # ("interna1_dual_arm_1", 0.5),
+        ("interna1_dual_arm_2", 0.5),
+        ("interna1_dual_arm_3", 0.5),
+        ("interna1_dual_arm_4", 0.5),
+    ],
+    
+    "ms_buy_data":[
+      ("ms_data_scale", 1.0),  
+    #   ("ms_data_xdof_3", 1.0),
+        ("toto", 1.0),
+        ("taco_play", 1.0)
+    ],
+    
+    "research_data":[
+        ("fractal20220817_data", 0.6),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.5),
+        ("bridge_orig", 0.5),                                   # Original Version of Bridge V2 from Project Website
+        ("taco_play", 1.0),
+        ("jaco_play", 1.0),
+        ("roboturk", 1.0),
+        ("berkeley_autolab_ur5", 1.0),
+        # ("language_table", 0.1),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 1.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.5),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("cmu_stretch", 1.0),
+        ## New Datasets in MagicSoup++
+        ("bc_z", 0.3),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 0.3),
+        ("dobbe", 0.3),
+        # ("droid", 0.01),
+        # ("agibot_alpha", 0.1),
+        # robomind
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.5),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+        # interna1
+        # ("interna1_dual_arm_0", 0.05),
+        # ("interna1_dual_arm_1", 0.05),
+        ("interna1_dual_arm_2", 0.1),
+        ("interna1_dual_arm_3", 0.1),
+        ("interna1_dual_arm_4", 0.1),
+        ("interna1_single_arm", 0.1),
+        # egodex
+        # ("ego_dex_split1", 0.05),
+        # ("ego_dex_split2", 0.05),
+        # ("ego_dex_split3", 0.05),
+        # ("ego_dex_split4", 0.05),
+        # ("ego_dex_split5", 0.05),
+        # ms_buy_data
+        ("ms_data_scale", 0.2),
+        ("ms_data_xdof_1", 0.12),
+        ("ms_data_xdof_2", 0.15),
+        ("ms_data_xdof_3", 0.15),
+        ("ms_data_xdof_4", 0.12),
+        # FTP-1
+        ("ftp_1_RH20TCfg5Franka", 1.0),
+        ("ftp_1_RH20TCfg6ATIAxia", 1.0),
+        ("ftp_1_RH20TCfg7Tactile", 1.0),
+        ("ftp_1_VLA_touch", 1.0),
+        ("ftp_1_ViTaMIn", 1.0),
+        ("ftp_1_VisuoTactile_QINGLOONG", 1.0),
+        ("ftp_1_exUMI", 1.0),
+        ("ftp_1_Unit", 2.0),
+        ("ftp_1_RDP_Bimanual", 2.0),
+        ("ftp_1_RDP", 2.0),
+        ("ftp_1_FreeTacMan", 1.0),
+        ("ftp_1_MotionTrans", 1.0),
+        ("ftp_1_sharpa", 0.2),
+        ("ftp_1_VisuoTactile_D-WHEEL", 0.5),
+        # open neo data
+        ("open_neo_arx5_single", 0.1),
+        ("open_neo_aloha", 0.1),
+        ("open_neo_arx5", 0.1),
+        ("open_neo_ur", 0.1),
+        ("open_neo_flexiv", 0.1),
+    ],
+    
+    "hq_research_data_stage0":[
+        ("fractal20220817_data", 1.0),
+        ("kuka", 0.5),
+        ("bridge_orig", 0.5),                                   # Original Version of Bridge V2 from Project Website
+        ("language_table", 0.1),
+        ("taco_play", 1.0),
+        ("jaco_play", 1.0),
+        ("bc_z", 0.3),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 0.3),
+        ("dobbe", 0.3),
+        ("droid", 0.1),
+        ("agibot_alpha", 0.1),
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.5),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+        # interna1
+        ("interna1_dual_arm_0", 0.01),
+        ("interna1_dual_arm_1", 0.01),
+        ("interna1_dual_arm_2", 0.1),
+        ("interna1_dual_arm_3", 0.1),
+        ("interna1_dual_arm_4", 0.1),
+        ("interna1_single_arm", 0.1),
+        # egodex
+        ("ego_dex_split1", 0.05),
+        ("ego_dex_split2", 0.05),
+        # ("ego_dex_split3", 0.05),
+        # ("ego_dex_split4", 0.05),
+        # ("ego_dex_split5", 0.05),
+        # ego10k
+        ("ego10k_part1", 0.01),
+        # ms_buy_data
+        ("ms_data_scale", 0.2),
+        ("ms_data_xdof_1", 0.12),
+        ("ms_data_xdof_2", 0.15),
+        ("ms_data_xdof_3", 0.15),
+        ("ms_data_xdof_4", 0.12),
+        # FTP-1
+        ("ftp_1_RH20TCfg5Franka", 1.0),
+        ("ftp_1_RH20TCfg6ATIAxia", 1.0),
+        ("ftp_1_RH20TCfg7Tactile", 1.0),
+        ("ftp_1_VLA_touch", 1.0),
+        ("ftp_1_ViTaMIn", 1.0),
+        ("ftp_1_VisuoTactile_QINGLOONG", 1.0),
+        ("ftp_1_exUMI", 1.0),
+        ("ftp_1_Unit", 2.0),
+        ("ftp_1_RDP_Bimanual", 2.0),
+        ("ftp_1_RDP", 2.0),
+        ("ftp_1_FreeTacMan", 1.0),
+        ("ftp_1_MotionTrans", 1.0),
+        ("ftp_1_sharpa", 0.2),
+        ("ftp_1_VisuoTactile_D-WHEEL", 0.5),
+        # open neo data
+        ("open_neo_arx5_single", 0.1),
+        ("open_neo_aloha", 0.1),
+        ("open_neo_arx5", 0.1),
+        ("open_neo_ur", 0.1),
+        ("open_neo_flexiv", 0.1),
+    ],
+    "hq_research_data_stage1":[
+        ("fractal20220817_data", 1.0),
+        ("kuka", 0.5),
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        ("language_table", 0.8),
+        ("taco_play", 1.0),
+        ("jaco_play", 1.0),
+        ("bc_z", 0.3),                                          # Note: use v0.1.0 --> later versions broken
+        ("fmb_dataset", 0.3),
+        ("dobbe", 0.3),
+        ("droid", 0.01),
+        ("agibot_alpha", 0.1),
+        ("robomind_franka_dual_arm", 1.0),
+        ("robomind_franka_3rgb", 1.0),
+        ("robomind_franka_1rgb", 1.5),
+        ("robomind_agilex_3rgb", 0.5),
+        ("robomind_ur_1rgb", 0.5),
+        # interna1
+        ("interna1_dual_arm_0", 0.01),
+        ("interna1_dual_arm_1", 0.1),
+        ("interna1_dual_arm_2", 0.1),
+        ("interna1_dual_arm_3", 0.1),
+        ("interna1_dual_arm_4", 2.0),
+        ("interna1_single_arm", 0.1),
+        # egodex
+        ("ego_dex_split1", 0.05),
+        ("ego_dex_split2", 0.05),
+        ("ego_dex_split3", 0.05),
+        ("ego_dex_split4", 0.05),
+        ("ego_dex_split5", 0.05),
+        # ego10k
+        ("ego10k_part1", 0.008),
+        # ms_buy_data
+        ("ms_data_scale", 0.2),
+        ("ms_data_xdof_1", 0.13),
+        ("ms_data_xdof_2", 0.16),
+        ("ms_data_xdof_3", 0.16),
+        ("ms_data_xdof_4", 0.13),
+        # FTP-1
+        ("ftp_1_RH20TCfg5Franka", 1.5),
+        ("ftp_1_RH20TCfg6ATIAxia", 1.5),
+        ("ftp_1_RH20TCfg7Tactile", 1.5),
+        ("ftp_1_VLA_touch", 1.5),
+        ("ftp_1_ViTaMIn", 1.5),
+        ("ftp_1_VisuoTactile_QINGLOONG", 1.5),
+        ("ftp_1_exUMI", 2.0),
+        ("ftp_1_Unit", 3.0),
+        ("ftp_1_RDP_Bimanual", 3.0),
+        ("ftp_1_RDP", 3.0),
+        ("ftp_1_FreeTacMan", 1.5),
+        ("ftp_1_MotionTrans", 1.5),
+        ("ftp_1_sharpa", 0.2),
+        ("ftp_1_VisuoTactile_D-WHEEL", 0.5),
+        # open neo data
+        ("open_neo_arx5_single", 0.3),
+        ("open_neo_aloha", 0.1),
+        ("open_neo_arx5", 0.1),
+        ("open_neo_ur", 0.1),
+        ("open_neo_flexiv", 0.1),
+        ("open_neo_umi", 0.01),
+        ("open_neo_umi_single", 0.02),
+    ],
+    
+    "ego_data":[
+        ("ego_dex_split1", 1.0),
+        ("ego_dex_split2", 1.0),
+        ("ego_dex_split3", 1.0),
+        ("ego_dex_split4", 1.0),
+        ("ego_dex_split5", 1.0),
+        ("ego10k_part1", 0.2), # 0.5 billion frames
+    ],
+    "ego_dex_split1":[
+        ("ego_dex_split1", 1.0),
+    ],
+    "egodex":[
+        ("ego_dex_split1", 1.0),
+        ("ego_dex_split2", 1.0),
+        ("ego_dex_split3", 1.0),
+        ("ego_dex_split4", 1.0),
+        ("ego_dex_split5", 1.0),
+    ],
+    
+    "debug_research_data":[
+        ("agibot_alpha", 0.1),
+        ("language_table", 0.1),
+        ("fractal20220817_data", 1.0),
+        ("taco_play", 1.0),
+        # ("ms_data_xdof_1", 0.01),
+        # ("ms_data_xdof_2", 0.01),
+        ("ms_data_xdof_3", 0.5),
+        ("ftp_1_sharpa", 0.5),
+        ("ego_dex_split4", 0.5),
+        ("ftp_1_VisuoTactile_D-WHEEL", 0.5),
+        ("ftp_1_exUMI", 1.0),
+        ("ftp_1_RH20TCfg5Franka", 1.0),
+        # ("ftp_1_sharpa_split_0", 1.0),
+        # ("ftp_1_VisuoTactile_D-WHEEL_split_0", 1.0),
+        ("ftp_1_RDP_Bimanual", 1.0),
+        ("open_neo_arx5_single", 0.5),
+        ("open_neo_aloha", 0.5)
+    ],
+    
+    "debug":[
+        # ("berkeley_autolab_ur5", 1.0),
+        # ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        # ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("taco_play", 1.0),
+        ("toto", 1.0),
+        # ("jaco_play", 1.0),
+        # ("robomind_franka_dual_arm", 1.0),
+        # # ("fractal20220817_data", 0.54087122203),
+        # ("bridge_orig", 1.0),   
+        # ("interna1_dual_arm_4", 1.0),
+    ],
+
+    # === T-DROID Dataset ===
+    "tdroid_carrot_in_bowl": [
+        ("tdroid_carrot_in_bowl", 1.0),
+    ],
+    "tdroid_pour_corn_in_pot": [
+        ("tdroid_pour_corn_in_pot", 1.0),
+    ],
+    "tdroid_flip_pot_upright": [
+        ("tdroid_flip_pot_upright", 1.0),
+    ],
+    "tdroid_move_object_onto_plate": [
+        ("tdroid_move_object_onto_plate", 1.0),
+    ],
+    "tdroid_knock_object_over": [
+        ("tdroid_knock_object_over", 1.0),
+    ],
+    "tdroid_cover_object_with_towel": [
+        ("tdroid_cover_object_with_towel", 1.0),
+    ],
+
+    # === DROID Finetuning Datasets ===
+    "droid_wipe": [
+        ("droid_wipe", 1.0),
+    ],
+
+    "debug_data": [
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+    ],
+
+    # === LIBERO Datasets (Modified Versions) ===
+    "libero_spatial_no_noops": [
+        ("libero_spatial_no_noops", 1.0),
+    ],
+    "libero_object_no_noops": [
+        ("libero_object_no_noops", 1.0),
+    ],
+    "libero_goal_no_noops": [
+        ("libero_goal_no_noops", 1.0),
+    ],
+    "libero_10_no_noops": [
+        ("libero_10_no_noops", 1.0),
+    ],
+    "mini" : [
+        # ("ego_dex_split3", 1),
+        ("simpler_bridge", 1),
+        ("local_game_minecraft", 1),
+        ("local_game_stardew", 1)
+    ],
+     "toy": [
+        ("jaco_play", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        # ("berkeley_cable_routing", 1.0),
+        ("roboturk", 2.0),
+        # ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("taco_play", 2.0),
+        ("rh20t", 1.0)
+     ],
+     "fractal_only": [
+         ("fractal20220817_data", 1.0), 
+     ],
+     "bridge_only":[
+         ("bridge_orig", 1.0), 
+     ],
+     "env_in_simpler":[
+         ("fractal20220817_data", 1.0), 
+         ("bridge_orig", 1.0), 
+     ],
+     "robodojo":[
+         ("robodojo", 1.0)
+     ],
+     "delta_robodojo_stack_bowl":[
+         ("delta_robodojo_stack_bowl", 1.0)
+     ],
+     "libero": [
+         ("libero_goal_no_noops", 1.0), 
+         ("libero_object_no_noops", 1.0), 
+         ("libero_spatial_no_noops", 1.0), 
+         ("libero_10_no_noops", 1.0),
+     ],
+     "libero_goal": [
+         ("libero_goal_no_noops", 1.0), 
+     ],
+     "libero_spatial": [
+         ("libero_spatial_no_noops", 1.0), 
+     ],
+     "libero_10": [
+         ("libero_10_no_noops", 1.0), 
+     ],
+     "libero_object": [
+         ("libero_object_no_noops", 1.0), 
+     ],
+     "simpler_fractal":[
+         ("simpler_fractal", 1.0), 
+     ],
+     "simpler_fractal_sub1":[
+         ("simpler_fractal_sub1", 1.0), 
+     ],
+     "simpler_fractal_sub2":[
+         ("simpler_fractal_sub2", 1.0), 
+     ],
+     "simpler_fractal_sub2_v1":[
+         ("simpler_fractal_sub2_v1", 1.0), 
+     ],
+     "simpler_fractal_sub2_v4":[
+         ("simpler_fractal_sub2_v4", 1.0), 
+     ],
+     "simpler_fractal_sub2_v2":[
+         ("simpler_fractal_sub2_v2", 1.0), 
+     ],
+     "simpler_fractal_sub2_v3":[
+         ("simpler_fractal_sub2_v3", 1.0), 
+     ],
+     "simpler_fractal_sub2_plus":[
+         ("simpler_fractal_sub2_plus", 1.0), 
+     ],
+     "simpler_bridge":[
+         ("simpler_bridge", 1.0), 
+     ],
+     "calvin_abc_d":[
+         ("calvin_abc_d", 1.0), 
+     ],
+     "calvin_abc_d_sub1":[
+         ("calvin_abc_d_sub1", 1.0), 
+     ],
+     "calvin_abcd_d":[
+         ("calvin_abcd_d", 1.0), 
+     ],
+     "pizza":[
+         ("pizza", 1.0),  
+     ],
+     "pizza_task_5":[
+         ("pizza_task_5", 1.0),  
+     ],
+     "pizza_task_9_sep1":[
+         ("pizza_task_9_sep1", 1.0),  
+     ],
+     "pizza_task_9_sep2":[
+         ("pizza_task_9_sep2", 1.0),  
+     ],
+     "pizza_task_20":[
+         ("pizza_task_20", 1.0),  
+     ],
+     "pizza_task_5_sep2":[
+         ("pizza_task_5_sep2", 1.0),  
+     ],
+     "pizza_task_16_sep1":[
+         ("pizza_task_16_sep1", 1.0),  
+     ],
+     "pizza_task_16_sep2":[
+         ("pizza_task_16_sep2", 1.0),  
+     ],
+     "pizza_task_3":[
+         ("pizza_task_3", 1.0),  
+     ],
+     "pizza_task_19":[
+         ("pizza_task_19", 1.0),  
+     ],
+     "cup_4hz":[
+         ("cup_4hz", 1.0),  
+     ],
+     "pizza_sub1":[
+         ("pizza_sub1", 1.0),  
+     ],
+     "pizza_sub2":[
+         ("pizza_sub2", 1.0),  
+     ],
+     "pizza_sub4":[
+         ("pizza_sub4", 1.0),  
+     ],
+     "ego_dex":[
+         ("ego_dex_split1", 1.0), 
+         ("ego_dex_split2", 1.0), 
+     ],
+}
+# fmt: on

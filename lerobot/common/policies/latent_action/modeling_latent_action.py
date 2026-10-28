@@ -1,0 +1,1016 @@
+import math
+from collections import deque
+
+import torch
+import torch.nn.functional as F  # noqa: N812
+from torch import Tensor, nn
+from transformers import AutoTokenizer, AutoModel, InternVLForConditionalGeneration, AutoConfig, LlamaForCausalLM, Trainer, InternVLProcessor
+
+from lerobot.common.constants import ACTION, OBS_ROBOT
+
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.common.utils.utils import get_safe_dtype
+from lerobot.common.policies.latent_action.configuration_latent_action import LatentActionConfig
+from lerobot.common.policies.latent_action.action_decoder import PaliGemmaWithExpertConfig, ActionDecoderModel
+from lerobot.common.policies.latent_action.image_decoder import ImagePredictionModel as SDModel
+from lerobot.common.policies.latent_action.uni_decoder import UniDecoder as UniDecoder2
+# from lerobot.common.policies.latent_action.image_decoder_sana import ImagePredictionModel as SANAModel
+from lerobot.common.policies.latent_action.image_decoder_sana_ip_adapter import ImagePredictionModel as SANAModel
+from lerobot.common.policies.latent_action.vlm_wrapper import InternVLModelWrapper
+from lerobot.common.constants import COMPRESS_ACTION_TOKEN, COMPRESS_SC_TOKEN
+import matplotlib.pyplot as plt
+
+import numpy as np
+import cv2
+from PIL import Image
+
+def get_generator(seed, device):
+
+    if seed is not None:
+        if isinstance(seed, list):
+            generator = [torch.Generator(device).manual_seed(seed_item) for seed_item in seed]
+        else:
+            generator = torch.Generator(device).manual_seed(seed)
+    else:
+        generator = None
+
+    return generator
+
+def pad_vector(vector, new_dim):
+    """Can be (batch_size x sequence_length x features_dimension)
+    or (batch_size x features_dimension)
+    """
+    if vector.shape[-1] == new_dim:
+        return vector
+    shape = list(vector.shape)
+    current_dim = shape[-1]
+    shape[-1] = new_dim
+    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+    new_vector[..., :current_dim] = vector
+    return new_vector
+
+def create_sinusoidal_pos_embedding(
+    time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+) -> Tensor:
+    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    if dimension % 2 != 0:
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
+
+    if time.ndim != 1:
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+
+    # Compute the outer product
+    scaling_factor = 1.0 / period * 2 * math.pi
+    sin_input = scaling_factor[None, :] * time[:, None]
+    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    return pos_emb
+
+def make_att_2d_masks(pad_masks, att_masks):
+    """Copied from big_vision.
+
+    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
+    smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
+    setup several types of attention, for example:
+
+      [[1 1 1 1 1 1]]: pure causal attention.
+
+      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
+          themselves and the last 3 tokens have a causal attention. The first
+          entry could also be a 1 without changing behaviour.
+
+      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
+          block can attend all previous blocks and all tokens on the same block.
+
+    Args:
+      input_mask: bool[B, N] true if its part of the input, false if padding.
+      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
+        it and 0 where it shares the same attention mask as the previous token.
+    """
+    if att_masks.ndim != 2:
+        raise ValueError(att_masks.ndim)
+    if pad_masks.ndim != 2:
+        raise ValueError(pad_masks.ndim)
+
+    cumsum = torch.cumsum(att_masks, dim=1)
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    att_2d_masks = att_2d_masks & pad_2d_masks
+    return att_2d_masks
+
+def save_attention_overlay_cv2(
+    original_image,      # H×W×3, RGB, np.uint8 or float
+    attention_map,       # h×w, torch.Tensor
+    output_path,
+    alpha=0.4,           # attention 权重
+    colormap=cv2.COLORMAP_JET
+):
+    # ---------- 原图处理 ----------
+    if original_image.dtype != np.uint8:
+        original_image = (original_image * 255).astype(np.uint8)
+
+    # RGB -> BGR (cv2 用 BGR)
+    original_bgr = cv2.cvtColor(original_image, cv2.COLOR_RGB2BGR)
+
+    h, w = original_bgr.shape[:2]
+
+    # ---------- attention resize ----------
+    att = F.interpolate(
+        attention_map.unsqueeze(0).unsqueeze(0).float(),
+        size=(h, w),
+        mode='bilinear',
+        align_corners=False
+    ).squeeze().cpu().numpy()
+
+    # ---------- normalize ----------
+    att = att - att.min()
+    att = att / (att.max() + 1e-8)
+    att = (att * 255).astype(np.uint8)
+
+    # ---------- colormap ----------
+    att_color = cv2.applyColorMap(att, colormap)
+
+    # ---------- overlay ----------
+    overlay = cv2.addWeighted(
+        original_bgr, 1 - alpha,
+        att_color, alpha,
+        0
+    )
+
+    # ---------- save ----------
+    cv2.imwrite(output_path, overlay)
+    print(f"Overlay saved to: {output_path}")
+
+def create_attention_visualization(original_image, attention_map, output_path):
+    """Create and save attention map visualization."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Original image
+    axes[0].imshow(original_image)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+
+    # Attention map
+    attention_resized = F.interpolate(
+        attention_map.unsqueeze(0).unsqueeze(0).to(torch.float32),
+        size=original_image.shape[:2],
+        mode='bilinear',
+        align_corners=False
+    ).squeeze().cpu().numpy()
+
+    im1 = axes[1].imshow(attention_resized, cmap='hot', alpha=0.8)
+    axes[1].set_title('Attention Map')
+    axes[1].axis('off')
+    plt.colorbar(im1, ax=axes[1])
+
+    # Overlay
+    axes[2].imshow(original_image)
+    axes[2].imshow(attention_resized, cmap='hot', alpha=0.8)
+    axes[2].set_title('Attention Overlay')
+    axes[2].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Attention visualization saved to: {output_path}")
+
+class LatentActionModel(PreTrainedPolicy):
+    """Wrapper class around PI0FlowMatching model to train and run inference within LeRobot."""
+
+    config_class = LatentActionConfig
+    name = "latent_act"
+
+    def __init__(
+        self,
+        config: LatentActionConfig,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+    ):
+        super().__init__(config)
+        config.validate_features()
+        self.config = config
+        # vlm_config = AutoConfig.from_pretrained(
+        #     self.config.vlm_path,
+        #     trust_remote_code=True
+        # )
+        # vlm_config.attn_implementation = "flash_attention_2"
+        # self.vlm = InternVLModelWrapper(config)
+        self.vlm = InternVLForConditionalGeneration.from_pretrained(self.config.vlm_path,
+                                                                    # config=vlm_config,
+                                                                    local_files_only=True,
+                                                                    trust_remote_code=True,
+                                                                    attn_implementation="eager"
+                                                                    )
+        
+        # self.vlm.lm_head = nn.Identity()
+        # output attention for visualization
+        self.vlm.config.output_attentions = True
+        if hasattr(self.vlm, "text_model"):
+            self.vlm.text_model.config.output_attentions = True
+        if hasattr(self.vlm, "vision_model"):
+            self.vlm.vision_model.config.output_attentions = True
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.vlm_path,
+                                                                    # config=vlm_config,
+                                                                    local_files_only=True,
+                                                                    trust_remote_code=True)
+        new_action_tokens = [f"[{COMPRESS_ACTION_TOKEN}]"]
+        new_scene_tokens = [f"[{COMPRESS_SC_TOKEN}]"]
+        self.tokenizer.add_tokens(new_action_tokens)
+        self.tokenizer.add_tokens(new_scene_tokens)
+
+        self.cp_act_token_idx =  [self.tokenizer(f"[{COMPRESS_ACTION_TOKEN}]", add_special_tokens=False).input_ids[0]]
+        self.cp_sc_token_idx = [self.tokenizer(f"[{COMPRESS_SC_TOKEN}]", add_special_tokens=False).input_ids[0]]
+        
+        print(f"In model: CP_IMG token idx: {self.cp_sc_token_idx}, CP_ACT token idx: {self.cp_act_token_idx}")
+        # vocab_size = self.vlm.config.vocab_size + 2
+        # self.
+        # print(self.vlm.loss_function) # ForCausalLMLoss
+        # 有效果这个: 39G (wo)-> 31G (w), for bs=1, max_frame=30
+        self.vlm.model.language_model._set_gradient_checkpointing()
+        self.vlm.model.vision_tower.gradient_checkpointing = True
+        self.vlm.model.vision_tower.encoder.gradient_checkpointing = True
+        # add it: 31G -> 24G
+        if self.config.freeze_vision_encoder:
+            print(f"Freeze VLM image encoder")
+            self.vlm.model.vision_tower.requires_grad_(False)
+
+        self.sc_token_idx = config.sc_token_idx
+        self.action_token_idx = config.action_token_idx
+        self.img_token_id = self.vlm.config.image_token_id
+        if config.is_distill == False:
+            self.uni_decoder = UniDecoder(config)
+            # self.uni_decoder = UniDecoder2(config)
+
+        self.dtype = torch.bfloat16
+
+    def reset(self):
+        """This should be called whenever the environment is reset."""
+        self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+    def get_optim_params(self) -> dict:
+        return self.parameters()
+    
+    @torch.no_grad
+    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        print("not use")
+    
+
+    def prepare_action(self, batch):
+        """Pad action"""
+        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        return actions
+    
+    def convert_to_dtype(self, vector:torch.Tensor):
+        if not isinstance(vector, type(None)):
+            if vector.is_floating_point():
+                vector = vector.to(dtype=self.dtype)
+        return vector
+    
+    def generate_token_mask(self, input_ids):
+        sc_token_ids = torch.tensor(self.sc_token_idx, device=input_ids.device)
+        act_token_ids = torch.tensor(self.action_token_idx, device=input_ids.device)
+        act_token_mask = torch.isin(input_ids, act_token_ids)
+        sc_token_mask = torch.isin(input_ids, sc_token_ids)
+        
+        # because the loss is ForCausalLMLoss
+        # sc_token_mask = torch.isin(input_ids[:, 1:], sc_token_ids)
+        # act_token_mask = torch.isin(input_ids[:, 1:], act_token_ids)
+        # bs = sc_token_mask.shape[0]
+        # pad = torch.zeros(bs, 1, dtype=torch.bool, device=act_token_ids.device)
+        # # print(act_token_mask.shape, pad.shape)
+        # act_token_mask = torch.cat([act_token_mask, pad], dim=1)
+        # sc_token_mask = torch.cat([sc_token_mask, pad], dim=1)
+        # print(sc_token_mask.sum().item(), act_token_mask.sum().item())
+        return sc_token_mask, act_token_mask
+    
+    def process_attn_map(self, att):
+        th = torch.quantile(att, 0.7)
+        att = torch.where(att >= th, att, torch.zeros_like(att))
+        att = att / (att.sum() + 1e-8)
+        return att
+    
+    def visualize_attn_map(self,batch: dict[str, Tensor], step) -> tuple[Tensor, dict[str, Tensor]]:
+        device = "cuda"
+        pixel_values = batch["pixel_values"].to(device=device)
+        input_ids = batch["input_ids"].to(device=device) # 对于224分辨率图像，每个image占64个token
+        labels = batch["labels"]
+        attention_mask = batch["attention_mask"].to(device=device)
+        video_len = batch["video_len"]
+        first_image = batch["first_image"].to(device=device)
+        last_image = batch["last_image"].to(device=device)
+        num_frames = pixel_values.shape[0]
+        # print(pixel_values.shape) # 16(batch size * T) 3 224 224
+        img1 = pixel_values[-1].detach().cpu().numpy()
+        img1 = img1.transpose(1, 2, 0)
+        mean = np.array([0.485, 0.456, 0.406])
+        std  = np.array([0.229, 0.224, 0.225])
+
+        img1 = img1 * std + mean
+        img1 = np.clip(img1, 0, 1)
+        img1 = (img1 * 255).astype(np.uint8)
+        # cv2.imwrite("debug.png", img1)
+        with torch.no_grad():
+            outputs = self.vlm(
+                input_ids=input_ids,
+                # labels=labels,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                output_attentions=True,
+                attn_implementation="eager",
+            )
+        all_attentions = outputs.attentions
+        # print(all_attentions)
+        # print(self.img_token_id, self.action_token_idx)
+        image_token_indicies = (input_ids == self.img_token_id).nonzero(as_tuple=True)[1]
+        motion_token_indicies = (input_ids == self.action_token_idx[0]).nonzero(as_tuple=True)[1]
+        scene_token_indicies = (input_ids == self.sc_token_idx[0]).nonzero(as_tuple=True)[1]
+        start_idx = image_token_indicies[0]
+        end_idx = image_token_indicies[-1]
+        # 1024 64
+        # print(len(image_token_indicies), len(motion_token_indicies), end_idx - start_idx + 1)
+        start_idx_motion = motion_token_indicies[0]
+        start_idx_scene = scene_token_indicies[0]
+        n_layer_to_collect = 27
+        n_layer_to_collect = min(n_layer_to_collect, len(all_attentions))
+        attn_maps_all_layers_motion = []
+        attn_maps_all_layers_scene = []
+        for layer_idx, layer_attn in enumerate(all_attentions[n_layer_to_collect-1:n_layer_to_collect]):
+            # layer_attn shape: (batch_size, num_heads, seq_len, seq_len)
+            # Average across heads
+            layer_attn_avg_head = layer_attn.mean(dim=1)
+            
+            # Extract attention from text tokens to vision tokens
+            # Text tokens are after the image tokens (end_idx+1:)
+            # Vision tokens are from start_idx to end_idx+1
+            layer_attn_text_to_vis_motion = layer_attn_avg_head[:, start_idx_motion:start_idx_motion + 64, image_token_indicies]
+            layer_attn_text_to_vis_scene = layer_attn_avg_head[:, start_idx_scene:start_idx_scene + 64, image_token_indicies]
+            
+            # Average over all text query positions
+            layer_attn_vis_avg_motion = layer_attn_text_to_vis_motion.mean(dim=1)
+            layer_attn_vis_avg_scene = layer_attn_text_to_vis_scene.mean(dim=1)
+            
+            # layer_attn_text_to_vis_motion = layer_attn_avg_head[:, image_token_indicies, start_idx_motion: start_idx_motion + 64]
+            # layer_attn_text_to_vis_scene = layer_attn_avg_head[:, image_token_indicies, start_idx_scene: start_idx_scene + 64]
+            # layer_attn_text_to_vis_scene = layer_attn_text_to_vis_scene.transpose(-1, -2)
+            # layer_attn_text_to_vis_motion = layer_attn_text_to_vis_motion.transpose(-1, -2)
+            
+            # Average over all text query positions
+            layer_attn_vis_avg_motion = layer_attn_text_to_vis_motion.mean(dim=1)
+            layer_attn_vis_avg_scene = layer_attn_text_to_vis_scene.mean(dim=1)
+            
+            attn_maps_all_layers_motion.append(layer_attn_vis_avg_motion)
+            attn_maps_all_layers_scene.append(layer_attn_vis_avg_scene)
+            # print(layer_attn_vis_avg.shape) # 1 1024
+        
+        attention_map_motion = torch.stack(attn_maps_all_layers_motion, dim=0).mean(dim=0)
+        attention_map_scene = torch.stack(attn_maps_all_layers_scene, dim=0).mean(dim=0)
+        selected_frame = pixel_values.shape[0] - 1
+        attention_map_motion = attention_map_motion[:, selected_frame * 64: (selected_frame + 1) * 64]
+        attention_map_scene = attention_map_scene[:, selected_frame * 64: (selected_frame + 1) * 64]
+        # print(attention_map.shape) # 1 64
+        # Handle batch dimension
+        if attention_map_motion.dim() > 1:
+            attention_map_motion = attention_map_motion.squeeze(0)  # Remove batch dimension
+            attention_map_scene = attention_map_scene.squeeze(0)  # Remove batch dimension
+
+        # print(f"Final attention map shape: {attention_map.shape}")
+
+        # Calculate grid size for spatial arrangement
+        num_patches = attention_map_motion.shape[0]
+        grid_size = math.ceil(math.sqrt(num_patches))
+
+        print(f"Number of vision tokens: {num_patches}")
+        print(f"Grid size: {grid_size}x{grid_size}")
+
+        # Pad at the END, not the beginning
+        if grid_size * grid_size != num_patches:
+            pad_size = grid_size * grid_size - num_patches
+            print(f"Padding with {pad_size} zeros at the END")
+            
+            zero_pad = torch.zeros(pad_size, dtype=attention_map_motion.dtype, device=attention_map_motion.device)
+            attention_map_motion = torch.cat([attention_map_motion, zero_pad], dim=0)
+            attention_map_scene = torch.cat([attention_map_scene, zero_pad], dim=0)
+
+        # Normalize attention map
+        # attention_map_motion = attention_map_motion.view(grid_size, grid_size)
+        # attention_map_motion = self.process_attn_map(attention_map_motion)
+        # attention_map_scene = attention_map_scene.view(grid_size, grid_size)
+        # attention_map_scene = self.process_attn_map(attention_map_scene)
+        
+        attention_map_motion = attention_map_motion.view(grid_size, grid_size)
+        attention_map_motion = attention_map_motion / (attention_map_motion.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        attention_map_scene = attention_map_scene.view(grid_size, grid_size)
+        attention_map_scene = attention_map_scene / (attention_map_scene.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # tau = 6
+        # attention_map_motion = attention_map_motion.view(-1)
+        # attention_map_motion = torch.softmax(attention_map_motion / tau, dim=0)
+        # attention_map_motion = attention_map_motion.view(grid_size, grid_size)
+        
+        # attention_map_scene = attention_map_scene.view(-1)
+        # attention_map_scene = torch.softmax(attention_map_scene / tau, dim=0)
+        # attention_map_scene = attention_map_scene.view(grid_size, grid_size)
+        
+        # save_attention_overlay_cv2, create_attention_visualization
+        save_attention_overlay_cv2(img1, attention_map_motion, f"vis/motion/attention_visualization_{step}.png")
+        save_attention_overlay_cv2(img1, attention_map_scene, f"vis/scene/attention_visualization_{step}.png")
+        
+        
+        
+    
+    # def forward_pi0(self, batch)
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor]]:
+        # print(batch["video_len"])
+        pixel_values = batch["pixel_values"]
+        input_ids = batch["input_ids"] # 对于224分辨率图像，每个image占64个token
+        labels = batch["labels"]
+        attention_mask = batch["attention_mask"]
+        video_len = batch["video_len"]
+        first_image = batch["first_image"]
+        last_image = batch["last_image"]
+        # print(input_ids.shape) # min: 2000, max: 4100
+        # print(first_image.shape, torch.max(first_image)) # 0-255
+        actions = self.prepare_action(batch)
+        actions = self.convert_to_dtype(actions)
+        bsize = input_ids.shape[0]
+        # torch.Size([B*T, 3, 224, 224]) torch.Size([1, 3266]) torch.Size([1, 3266])
+        # print(pixel_values.shape, input_ids.shape, attention_mask.shape)
+        output = self.vlm(
+            input_ids=input_ids,
+            # labels=labels,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        output_hidden_states = output.hidden_states # num_layers + 1
+        sc_token_mask, act_token_mask = self.generate_token_mask(input_ids)
+        # get token embeddings
+        # torch.Size([128, 1024])
+        sc_embeddings = output_hidden_states[-1][sc_token_mask]
+        act_embeddings = output_hidden_states[-1][act_token_mask]
+        hidden_size = sc_embeddings.shape[-1]
+        sc_embeddings = sc_embeddings.view(bsize, -1, hidden_size)
+        act_embeddings = act_embeddings.view(bsize, -1, hidden_size)
+        # print(sc_embeddings.shape, act_embeddings.shape)
+        # feed them into the decoder
+        # for image, feed sc_embedding and first image into the decoder
+        # for action, feed sc_embeddings, act_embeddings into the decoder
+        # pixel_values = pixel_values.view(bsize, -1, 3, h, w)
+        loss_dict = {}
+        actions_is_pad = batch.get("action_is_pad")
+        # print(actions_is_pad)
+        losses = self.uni_decoder(first_image,
+                                  last_image, 
+                                  sc_embeddings, 
+                                  act_embeddings, 
+                                  actions)
+        action_loss = losses["action_loss"]
+        image_loss = losses["image_loss"]
+        # lg_loss = output.loss # use this will increase memory a lot
+        lg_loss = torch.tensor(0.0, device=action_loss.device)
+        # print(lg_loss)
+        loss_dict["action_losses_after_forward"] = action_loss.clone()
+
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            # print(in_episode_bound.shape, action_loss.shape)
+            action_loss = action_loss * in_episode_bound.unsqueeze(-1)
+            loss_dict["action_losses_after_in_ep_bound"] = action_loss.clone()
+
+        # Remove padding
+        # action_loss = action_loss[:, :, : self.config.max_action_dim]
+        
+        loss_dict["action_losses_after_rm_padding"] = action_loss.clone()
+
+        # For backward pass
+        loss = action_loss.mean() + self.config.img_loss_weight * image_loss.mean() + lg_loss.mean()
+        # For logging
+        loss_dict["total_loss"] = loss.item()
+        loss_dict["action_loss"] = action_loss.mean().item()
+        loss_dict["image_loss"] = image_loss.mean().item()
+        loss_dict["language_loss"] = lg_loss.mean().item()
+        # print(loss_dict["total_loss"], loss_dict["action_loss"], loss_dict["image_loss"])
+
+        return loss, loss_dict
+
+    def extract_latent_embeddings(self, batch: dict[str, Tensor]):
+        pixel_values = batch["pixel_values"]
+        input_ids = batch["input_ids"] # 对于224分辨率图像，每个image占64个token
+        attention_mask = batch["attention_mask"].to(dtype=self.dtype)
+        output = self.vlm(
+            input_ids=input_ids,
+            # labels=labels,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        # output_hidden_states = output
+        output_hidden_states = output.hidden_states # num_layers + 1
+        # logits = output.logits
+        sc_token_mask, act_token_mask = self.generate_token_mask(input_ids)
+        # get token embeddings
+        # torch.Size([128, 1024]) torch.Size([4, 1024])
+        last_hidden_states = output_hidden_states[-1]
+        # last_hidden_states = self.vlm.model.language_model.norm(last_hidden_states)
+        
+        sc_embeddings = last_hidden_states[sc_token_mask]
+        act_embeddings = last_hidden_states[act_token_mask]
+        # sc_logits = logits[sc_token_mask]
+        # act_logits = logits[act_token_mask]
+        # print(sc_logits.shape, act_logits.shape, logits.shape, )
+        hidden_size = sc_embeddings.shape[-1]
+        bsize = input_ids.shape[0]
+        sc_embeddings = sc_embeddings.view(bsize, -1, hidden_size).to(dtype=self.dtype)
+        act_embeddings = act_embeddings.view(bsize, -1, hidden_size).to(dtype=self.dtype)
+
+        # sc_logits = sc_logits.view(bsize, -1, hidden_size).to(dtype=self.dtype)
+        # act_logits = act_logits.view(bsize, -1, hidden_size).to(dtype=self.dtype)
+
+
+        # print(sc_embeddings.shape, act_embeddings.shape)
+        latent_embeddings = torch.cat([sc_embeddings, act_embeddings], dim=1)
+        # latent_logits = torch.cat([sc_logits, act_logits], dim=1)
+        # print(latent_embeddings.shape, latent_logits.shape)
+        return latent_embeddings
+
+    def infer_tokens(self, batch: dict[str, Tensor]):
+        pixel_values = batch["pixel_values"]
+        input_ids = batch["input_ids"] # 对于224分辨率图像，每个image占64个token
+        attention_mask = batch["attention_mask"].to(dtype=self.dtype)
+        video_len = batch["video_len"]
+        first_image = batch["first_image"]
+        # print(input_ids.shape, pixel_values.shape)
+        # print(input_ids.shape) # min: 2000, max: 4100
+        # print(first_image.shape, torch.max(first_image)) # 0-255
+        actions = self.prepare_action(batch)
+        actions = self.convert_to_dtype(actions)
+        bsize = input_ids.shape[0]
+        # torch.Size([B*T, 3, 224, 224]) torch.Size([1, 3266]) torch.Size([1, 3266])
+        # print(pixel_values.shape, input_ids.shape, attention_mask.shape)
+        generate_ids = self.vlm.generate(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            max_new_tokens=self.config.num_sc_token + self.config.num_action_token,
+        )
+        responese = self.tokenizer.batch_decode(generate_ids, skip_special_tokens=True)
+        print(responese)
+
+
+    def infer(self, batch: dict[str, Tensor]):
+        pixel_values = batch["pixel_values"]
+        input_ids = batch["input_ids"] # 对于224分辨率图像，每个image占64个token
+        attention_mask = batch["attention_mask"].to(dtype=self.dtype)
+        video_len = batch["video_len"]
+        first_image = batch["first_image"]
+        # print(input_ids.shape, pixel_values.shape)
+        # print(input_ids.shape) # min: 2000, max: 4100
+        # print(first_image.shape, torch.max(first_image)) # 0-255
+        actions = self.prepare_action(batch)
+        actions = self.convert_to_dtype(actions)
+        bsize = input_ids.shape[0]
+        # torch.Size([B*T, 3, 224, 224]) torch.Size([1, 3266]) torch.Size([1, 3266])
+        # print(pixel_values.shape, input_ids.shape, attention_mask.shape)
+        output = self.vlm(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        
+        # output_hidden_states = output
+        output_hidden_states = output.hidden_states # num_layers + 1
+        sc_token_mask, act_token_mask = self.generate_token_mask(input_ids)
+        # get token embeddings
+        # torch.Size([128, 1024]) torch.Size([4, 1024])
+        sc_embeddings = output_hidden_states[-1][sc_token_mask]
+        act_embeddings = output_hidden_states[-1][act_token_mask]
+        hidden_size = sc_embeddings.shape[-1]
+        sc_embeddings = sc_embeddings.view(bsize, -1, hidden_size).to(dtype=self.dtype)
+        act_embeddings = act_embeddings.view(bsize, -1, hidden_size).to(dtype=self.dtype)
+
+        actions_is_pad = batch.get("action_is_pad")
+        # print(batch.keys())
+        # print(sc_embeddings.shape, act_embeddings.shape)
+
+        actions = self.uni_decoder.sample_actions(sc_embeddings, act_embeddings) # 128
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            actions = actions * in_episode_bound.unsqueeze(-1)
+        actions = actions.detach().cpu()
+
+        # denormalization
+        mean = batch["action.mean"]
+        std = batch["action.std"]
+        # print(actions.shape, mean.shape)
+        actions = actions * (std + 1e-8) + mean
+        
+        # actions = actions.numpy()
+
+        furture_image = self.uni_decoder.sample_ip_adapter_images(first_image, 
+                                                                  sc_embeddings,
+                                                                  # default 20
+                                                                  num_inference_steps=20)
+
+        return actions, furture_image
+
+def sample_beta(alpha, beta, bsize, device):
+    gamma1 = torch.empty((bsize,), device=device).uniform_(0, 1).pow(1 / alpha)
+    gamma2 = torch.empty((bsize,), device=device).uniform_(0, 1).pow(1 / beta)
+    return gamma1 / (gamma1 + gamma2)
+
+class UniDecoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        paligemma_with_expert_config = PaliGemmaWithExpertConfig(
+            freeze_vision_encoder=self.config.freeze_vision_encoder,
+            train_expert_only=self.config.train_expert_only,
+            attention_implementation=self.config.attention_implementation,
+        )
+        self.action_decoder = ActionDecoderModel(paligemma_with_expert_config, config.action_expert_path)
+
+        # Projections are float32
+        self.con_proj = nn.Linear(self.config.vlm_token_dim, self.config.img_dim)
+        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
+        self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
+
+        self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
+        self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+
+        # image decoder
+        # self.image_decoder = ImagePredictionModel(config)
+        self.image_decoder = SANAModel(config)
+
+        self.dtype = torch.bfloat16
+        self.decoder_proj_type = config.ip_token_gen_type
+    
+    def sample_noise(self, shape, device):
+        noise = torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=shape,
+            dtype=self.dtype,
+            device=device,
+        )
+        return noise
+
+    def sample_time(self, bsize, device):
+        time_beta = sample_beta(1.5, 1.0, bsize, device)
+        time = time_beta * 0.999 + 0.001
+        return time.to(dtype=self.dtype, device=device)
+
+    def embed_prefix_for_action(self, con_embeddings):
+        embs = []
+        pad_masks = []
+        att_masks = []
+        bsize = con_embeddings.shape[0]
+        # for img in images:
+        #     img_emb = self.paligemma_with_expert.embed_image(img)
+        #     img_emb = img_emb.to(dtype=torch.bfloat16)
+        #     # Normalize image embeddings
+        #     img_emb_dim = img_emb.shape[-1]
+        #     img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+        #     bsize, num_img_embs = img_emb.shape[:2]
+        #     embs.append(img_emb)
+        #     # Create attention masks so that image tokens attend to each other
+        #     att_masks += [0] * num_img_embs
+
+        #     img_mask = torch.ones(bsize, dtype=torch.bool, device=img_emb.device)
+        #     img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+        #     pad_masks.append(img_mask)
+
+        # torch.Size([2, 256, 2048]) torch.Size([2, 66, 1024])
+        # print(embs[0].shape, con_embeddings.shape)
+        con_embeddings = self.con_proj(con_embeddings)
+        embs.append(con_embeddings)
+        num_con = con_embeddings.shape[1]
+        att_masks += [0] * num_con
+        con_mask = torch.ones(bsize, num_con, dtype=torch.bool, device=con_embeddings.device)
+        pad_masks.append(con_mask)
+        # print(pad_masks[0].shape, pad_masks[-1].shape)
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        return embs, pad_masks, att_masks
+    
+    def embed_suffix_for_action(self, noisy_actions, timestep):
+        embs = []
+        pad_masks = []
+        att_masks = []
+        dtype = noisy_actions.dtype
+        device = noisy_actions.device
+
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep, self.config.proj_width, min_period=4e-3, max_period=4.0, device=device
+        )
+        time_emb = time_emb.type(dtype=dtype)
+
+        # Fuse timestep + action information using an MLP
+        action_emb = self.action_in_proj(noisy_actions)
+
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)  # swish == silu
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
+
+        # Add to input tokens
+        embs.append(action_time_emb)
+
+        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        pad_masks.append(action_time_mask)
+
+        # Set attention masks so that image, language and state inputs do not attend to action tokens
+        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        # print(f"pad mask shape is: {pad_masks.shape}")
+        # print(f"att mask shape is: {att_masks.shape}")
+        return embs, pad_masks, att_masks
+
+    def forward_action_decoder(self, sc_embedding, act_embeddings, 
+        actions, action_noise=None, action_time=None):
+        if action_noise is None:
+            action_noise = self.sample_noise(actions.shape, actions.device).to(dtype=self.dtype)
+
+        if action_time is None:
+            action_time = self.sample_time(actions.shape[0], actions.device).to(dtype=self.dtype)
+
+        action_time_expanded = action_time[:, None, None]
+        actions = actions.to(dtype=self.dtype)
+        x_t = action_time_expanded * action_noise + (1 - action_time_expanded) * actions
+        u_t = action_noise - actions
+        # print(sc_embedding.shape, act_embeddings.shape)
+        con_embeddings = torch.cat([sc_embedding, act_embeddings], dim = 1)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_for_action(
+            con_embeddings=con_embeddings
+        )
+        # torch.Size([2, 578, 2048])
+        # print(prefix_embs.shape)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_for_action(x_t, action_time)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        (_, suffix_out), _ = self.action_decoder.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        # print(suffix_out.shape)
+        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        # Original openpi code, upcast attention output
+        # suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.dtype)
+        v_t = self.action_out_proj(suffix_out)
+
+        action_loss = F.mse_loss(u_t, v_t, reduction="none")
+        return action_loss
+
+    def forward(
+        self, first_image, last_image, sc_embedding, act_embeddings, 
+        actions, action_noise=None, action_time=None
+    ) -> Tensor:
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+
+        losses = {}
+        losses["action_loss"] = self.forward_action_decoder(sc_embedding, act_embeddings, actions)
+        # losses["action_loss"] = torch.tensor(0.0, device=sc_embedding.device)
+        # image predict
+        losses["image_loss"] = self.image_decoder(sc_embedding, first_image, last_image)
+        return losses
+
+    def sample_actions(self, sc_embedding, act_embeddings, action_noise = None):
+        bsize = sc_embedding.shape[0]
+        device = sc_embedding.device
+        if action_noise is None:
+            actions_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+        
+        con_embeddings = torch.cat([sc_embedding, act_embeddings], dim = 1)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_for_action(
+            con_embeddings=con_embeddings
+        )
+        # print(prefix_embs.shape)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.action_decoder.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        dt = -1.0 / self.config.num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+            )
+
+            # Euler step
+            x_t += dt * v_t
+            time += dt
+        return x_t
+
+    def denoise_step(
+        self,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+    ):
+        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_for_action(x_t, timestep)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        outputs_embeds, _ = self.action_decoder.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=False,
+        )
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        # suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
+
+    def sample_ip_adapter_images(self, cond_image, sc_embeddings, num_inference_steps=10):
+        # print("123")
+        prompt_embeds = self.image_decoder.con_proj(sc_embeddings)
+        # print(prompt_embeds.shape)
+        device = prompt_embeds.device
+        clip_imgs = []
+        bs = cond_image.shape[0]
+        cond_image = cond_image.permute(0, 2, 3, 1)
+        cond_image = cond_image.detach().cpu().numpy()
+        for i in range(bs):
+            img = cond_image[i]
+            pil_img = Image.fromarray(img, mode="RGB")
+            clip_img = self.image_decoder.clip_processor(images=pil_img, return_tensors="pt").pixel_values
+            clip_imgs.append(clip_img)
+        clip_imgs = torch.cat(clip_imgs, dim = 0).to(device=device)
+        # for img_proj_model is projection
+        if self.decoder_proj_type == "cls_proj":
+            # print("cls_proj")
+            image_embeds = self.image_decoder.image_encoder(clip_imgs).image_embeds # this is cls token embedding
+        # for img_proj_model is resampler
+        else:
+            # print("resampler")
+            image_embeds = self.image_decoder.image_encoder(clip_imgs, output_hidden_states=True).hidden_states[-2]
+        # print(image_embeds.shape)
+        ip_tokens = self.image_decoder.img_proj_model(image_embeds) # torch.Size([25, 4, 1152])
+        # print(ip_tokens.shape)
+        b, h, w, c = cond_image.shape
+        # because we double the channel in the config
+        latent_channels = self.image_decoder.transformer.config.in_channels
+        latents = self.image_decoder.prepare_latents(b, latent_channels, 
+                                                     h, w, self.dtype, device)
+        # print(latents.shape)
+        
+        self.image_decoder.noise_scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.image_decoder.noise_scheduler.timesteps
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.image_decoder.noise_scheduler.order, 0)
+        for i, t in enumerate(timesteps):
+            # no classifier_free_guidance
+            latent_model_input = latents
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timestep = t.expand(latent_model_input.shape[0])
+            timestep = timestep * self.image_decoder.transformer.config.timestep_scale
+            # print(latent_model_input.shape)
+
+            # predict noise model_output
+            # print(self.image_decoder.transformer)
+            noise_pred = self.image_decoder.transformer(
+                latent_model_input.to(dtype=self.dtype),
+                encoder_hidden_states=prompt_embeds.to(dtype=self.dtype),
+                ip_tokens=ip_tokens,
+                timestep=timestep,
+                return_dict=False
+            )[0]
+            noise_pred = noise_pred.float()
+
+            # learned sigma
+            # print(self.image_decoder.transformer.config.out_channels // 2, latent_channels)
+            if self.image_decoder.transformer.config.out_channels // 2 == latent_channels:
+                noise_pred = noise_pred.chunk(2, dim=1)[0]
+
+            # compute previous image: x_t -> x_t-1
+            # print(noise_pred.shape, latents.shape)
+            latents = self.image_decoder.noise_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        
+        try:
+            latents = latents.to(dtype=self.dtype)
+            image = self.image_decoder.vae.decode(latents / self.image_decoder.vae.config.scaling_factor, return_dict=False)[0]
+        except Exception as e:
+            print(
+                f"{e}. \n"
+                f"Try to use VAE tiling for large images. For example: \n"
+                f"pipe.vae.enable_tiling(tile_sample_min_width=512, tile_sample_min_height=512)"
+            )
+        image = self.image_decoder.image_processor.postprocess(image, output_type="np")
+        return image
+
+
+    def sample_images(self, first_image, sc_embeddings, num_inference_steps=10):
+        # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/sana/pipeline_sana.py#L131
+        b, c, h, w = first_image.shape
+        device = first_image.device
+        # because we double the channel in the config
+        latent_channels = self.image_decoder.transformer.config.in_channels // 2 # 32
+        latents = self.image_decoder.prepare_latents(b, latent_channels, 
+                                                     h, w, self.dtype, device)
+        prompt_embeds = self.image_decoder.con_proj(sc_embeddings)
+        prompt_attention_mask = torch.ones(prompt_embeds.shape[0], prompt_embeds.shape[1], dtype=torch.long, device=prompt_embeds.device)
+        image_latents = self.image_decoder.vae.encode(first_image.to(self.dtype)).latent
+        self.image_decoder.noise_scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.image_decoder.noise_scheduler.timesteps
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.image_decoder.noise_scheduler.order, 0)
+        for i, t in enumerate(timesteps):
+            # no classifier_free_guidance
+            latent_model_input = latents
+            # concat latents, image_latents in the channel dimension
+            latent_model_input = torch.cat([latent_model_input, image_latents], dim=1)
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timestep = t.expand(latent_model_input.shape[0])
+            timestep = timestep * self.image_decoder.transformer.config.timestep_scale
+            # print(latent_model_input.shape)
+
+            # predict noise model_output
+            noise_pred = self.image_decoder.transformer(
+                latent_model_input.to(dtype=self.dtype),
+                encoder_hidden_states=prompt_embeds.to(dtype=self.dtype),
+                encoder_attention_mask=prompt_attention_mask,
+                timestep=timestep,
+                return_dict=False
+            )[0]
+            noise_pred = noise_pred.float()
+
+            # learned sigma
+            # print(self.image_decoder.transformer.config.out_channels // 2, latent_channels)
+            if self.image_decoder.transformer.config.out_channels // 2 == latent_channels:
+                noise_pred = noise_pred.chunk(2, dim=1)[0]
+
+            # compute previous image: x_t -> x_t-1
+            latents = self.image_decoder.noise_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        
+        
+        try:
+            latents = latents.to(dtype=self.dtype)
+            image = self.image_decoder.vae.decode(latents / self.image_decoder.vae.config.scaling_factor, return_dict=False)[0]
+        except Exception as e:
+            print(
+                f"{e}. \n"
+                f"Try to use VAE tiling for large images. For example: \n"
+                f"pipe.vae.enable_tiling(tile_sample_min_width=512, tile_sample_min_height=512)"
+            )
+        image = self.image_decoder.image_processor.postprocess(image, output_type="np")
+        return image
+

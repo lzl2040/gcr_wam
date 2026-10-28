@@ -1,0 +1,424 @@
+"""Batch sampler shaping the negatives of the perception <-> physical contrastive loss.
+
+Uniform random batches make the task too easy: telling a kitchen scene apart from a
+factory scene needs no understanding of motion at all. This sampler builds batches that
+are hard *by construction*:
+
+1. ``same_dataset_frac`` of a batch comes from a single dataset, so negatives share the
+   embodiment, camera and scene statistics.
+2. ``episode_group_frac`` of that majority is drawn as small groups of frames from the
+   *same episode*. Those are the hardest negatives available: identical scene, identical
+   robot, only the motion differs.
+3. Frames inside one episode group are forced at least ``min_frame_gap`` frames apart, so
+   a "negative" is never a near-duplicate of the anchor (which would be a false negative).
+4. The remaining slots are filled from the whole mixture to keep some easy negatives and
+   avoid collapsing onto a single dataset's statistics.
+
+Every episode frame can start a window. The loader repeats final observations and
+pads actions with zero controls (identity ort6d rotations), holding the last real
+gripper controls beyond the episode.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+
+import numpy as np
+from torch.utils.data import Sampler
+
+from lerobot.common.datasets.contrastive_sample_pool import CompactSamplePool
+
+
+class ContrastiveBatchSampler(Sampler):
+    """Distributed batch sampler yielding lists of ``(dataset_idx, frame_idx)`` tuples.
+
+    With ``balance_across_ranks=True``, the old rank-local hard-negative batches are first
+    constructed as one global batch and then re-sharded across ranks. This preserves the exact
+    global sample set while preventing one rank from receiving nearly all expensive
+    tactile/video samples and becoming a straggler or OOM victim before the contrastive
+    all-gather. The option is explicit because fixed evaluation intentionally preserves its
+    historical rank-local batch structure.
+    """
+
+    def __init__(
+        self,
+        episode_ranges: list[np.ndarray],
+        sample_weights: np.ndarray,
+        batch_size: int,
+        num_replicas: int = 1,
+        rank: int = 0,
+        seed: int = 0,
+        samples_per_epoch: int = 100_000,
+        horizon: int | list[int] = 16,
+        same_dataset_frac: float = 0.75,
+        episode_group_frac: float = 0.75,
+        episode_group_size: int = 8,
+        min_frame_gap: int = 32,
+        sample_costs: np.ndarray | list[float] | None = None,
+        dataset_has_physical: np.ndarray | list[bool] | None = None,
+        min_physical_per_batch: int = 2,
+        balance_across_ranks: bool = False,
+        sample_pool: CompactSamplePool | None = None,
+    ):
+        self.episode_ranges = episode_ranges
+        self.batch_size = batch_size
+        self.sample_weights = np.asarray(sample_weights, dtype=np.float64)
+        if sample_pool is not None and sample_pool.num_datasets != len(
+            self.sample_weights
+        ):
+            raise ValueError(
+                f"sample_pool has {sample_pool.num_datasets} datasets, expected "
+                f"{len(self.sample_weights)}."
+            )
+        self.sample_pool = sample_pool
+        self.sample_weights = self.sample_weights / self.sample_weights.sum()
+        if sample_costs is None:
+            self.sample_costs = np.ones(len(self.sample_weights), dtype=np.float64)
+        else:
+            self.sample_costs = np.asarray(sample_costs, dtype=np.float64)
+            if self.sample_costs.shape != self.sample_weights.shape:
+                raise ValueError(
+                    f"sample_costs has shape {self.sample_costs.shape}, expected "
+                    f"{self.sample_weights.shape}."
+                )
+            if not np.isfinite(self.sample_costs).all() or (self.sample_costs <= 0).any():
+                raise ValueError("sample_costs must contain only finite positive values.")
+        if dataset_has_physical is None:
+            self.dataset_has_physical = np.ones(len(self.sample_weights), dtype=bool)
+        else:
+            self.dataset_has_physical = np.asarray(dataset_has_physical, dtype=bool)
+            if self.dataset_has_physical.shape != self.sample_weights.shape:
+                raise ValueError(
+                    f"dataset_has_physical has shape {self.dataset_has_physical.shape}, "
+                    f"expected {self.sample_weights.shape}."
+                )
+        physical_weights = self.sample_weights * self.dataset_has_physical
+        if physical_weights.sum() > 0:
+            self.physical_sample_weights = physical_weights / physical_weights.sum()
+            self.min_physical_per_batch = min(
+                self.batch_size,
+                max(0, int(min_physical_per_batch)),
+            )
+        else:
+            self.physical_sample_weights = None
+            self.min_physical_per_batch = 0
+        self.num_replicas = max(1, num_replicas)
+        self.rank = rank
+        self.seed = seed
+        # Duration-based windows have a different frame horizon at each recording rate.
+        if isinstance(horizon, (list, tuple, np.ndarray)):
+            if len(horizon) != len(episode_ranges):
+                raise ValueError(
+                    f"horizon has {len(horizon)} entries but there are {len(episode_ranges)} "
+                    "datasets; it must supply one horizon per dataset."
+                )
+            self.horizons = [int(h) for h in horizon]
+        else:
+            self.horizons = [int(horizon)] * len(episode_ranges)
+        self.same_dataset_frac = float(np.clip(same_dataset_frac, 0.0, 1.0))
+        self.episode_group_frac = float(np.clip(episode_group_frac, 0.0, 1.0))
+        self.episode_group_size = max(2, episode_group_size)
+        self.min_frame_gap = max(1, min_frame_gap)
+        self.balance_across_ranks = bool(balance_across_ranks)
+        self.epoch = 0
+        self.start_batch = 0
+
+        self.usable = []
+        for ranges in episode_ranges:
+            self.usable.append(ranges[ranges[:, 1] > ranges[:, 0]].copy())
+
+        total_batches = max(1, samples_per_epoch // (batch_size * self.num_replicas))
+        self.num_batches = total_batches
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        self.start_batch = 0
+
+    def set_start_batch(self, start_batch: int) -> None:
+        if start_batch < 0 or start_batch > self.num_batches:
+            raise ValueError(
+                f"start_batch must be in [0, {self.num_batches}], got {start_batch}."
+            )
+        self.start_batch = int(start_batch)
+
+    def __len__(self) -> int:
+        return self.num_batches - self.start_batch
+
+    def _pick_dataset(self, rng: np.random.Generator) -> int:
+        return int(rng.choice(len(self.sample_weights), p=self.sample_weights))
+
+    def _pick_physical_dataset(self, rng: np.random.Generator) -> int:
+        return int(
+            rng.choice(
+                len(self.physical_sample_weights),
+                p=self.physical_sample_weights,
+            )
+        )
+
+    def _random_frame(self, rng: np.random.Generator, ds_idx: int) -> int:
+        if self.sample_pool is not None:
+            return self.sample_pool.sample_frame(rng, ds_idx)
+        usable = self.usable[ds_idx]
+        ep = int(rng.integers(0, len(usable)))
+        start, end = usable[ep]
+        return int(rng.integers(start, end))
+
+    def _episode_group(self, rng: np.random.Generator, ds_idx: int, count: int) -> list[int]:
+        """Sample up to ``count`` frames of one episode, pairwise ``min_frame_gap`` apart."""
+        if self.sample_pool is not None:
+            return self.sample_pool.sample_episode_group(
+                rng,
+                ds_idx,
+                count,
+                self.min_frame_gap,
+            )
+        usable = self.usable[ds_idx]
+        ep = int(rng.integers(0, len(usable)))
+        start, end = int(usable[ep][0]), int(usable[ep][1])
+        span = end - start
+        if span <= 0:
+            return [start]
+
+        # A stride-based draw guarantees the minimum gap without rejection sampling.
+        max_slots = max(1, span // self.min_frame_gap)
+        k = int(min(count, max_slots))
+        slots = rng.choice(max_slots, size=k, replace=False)
+        frames = []
+        for slot in slots:
+            lo = start + int(slot) * self.min_frame_gap
+            hi = min(lo + self.min_frame_gap, end)
+            frames.append(int(rng.integers(lo, max(lo + 1, hi))))
+        return frames
+
+    def _build_batch(self, rng: np.random.Generator) -> list[tuple[int, int]]:
+        batch: list[tuple[int, int]] = []
+        main_ds = self._pick_dataset(rng)
+
+        n_main = int(round(self.batch_size * self.same_dataset_frac))
+        n_group = int(round(n_main * self.episode_group_frac))
+
+        while len(batch) < n_group:
+            remaining = n_group - len(batch)
+            frames = self._episode_group(rng, main_ds, min(self.episode_group_size, remaining))
+            batch.extend((main_ds, f) for f in frames)
+
+        while len(batch) < n_main:
+            batch.append((main_ds, self._random_frame(rng, main_ds)))
+
+        while len(batch) < self.batch_size:
+            ds_idx = self._pick_dataset(rng)
+            batch.append((ds_idx, self._random_frame(rng, ds_idx)))
+
+        batch = batch[: self.batch_size]
+        num_physical = sum(
+            self.dataset_has_physical[dataset_idx] for dataset_idx, _ in batch
+        )
+        if num_physical < self.min_physical_per_batch:
+            replace_positions = [
+                index
+                for index in range(len(batch) - 1, -1, -1)
+                if not self.dataset_has_physical[batch[index][0]]
+            ]
+            for position in replace_positions[
+                : self.min_physical_per_batch - num_physical
+            ]:
+                dataset_idx = self._pick_physical_dataset(rng)
+                batch[position] = (
+                    dataset_idx,
+                    self._random_frame(rng, dataset_idx),
+                )
+        perm = rng.permutation(len(batch))
+        return [batch[i] for i in perm]
+
+    def _global_batch(self, local_batch_id: int) -> list[tuple[int, int]]:
+        """Reproduce the old per-rank batches, concatenated in virtual-rank order."""
+        batch = []
+        for virtual_rank in range(self.num_replicas):
+            global_batch_id = local_batch_id * self.num_replicas + virtual_rank
+            rng = np.random.default_rng([self.seed, self.epoch, global_batch_id])
+            batch.extend(self._build_batch(rng))
+        return batch
+
+    def _balanced_rank_batches(
+        self,
+        global_batch: list[tuple[int, int]],
+    ) -> list[list[tuple[int, int]]]:
+        """Partition a fixed global batch by dataset frequency and estimated sample cost."""
+        if len(global_batch) != self.batch_size * self.num_replicas:
+            raise ValueError(
+                f"Expected {self.batch_size * self.num_replicas} global samples, "
+                f"got {len(global_batch)}."
+            )
+
+        assignments: list[list[tuple[int, tuple[int, int]]]] = [
+            [] for _ in range(self.num_replicas)
+        ]
+        loads = np.zeros(self.num_replicas, dtype=np.float64)
+        dataset_counts = np.zeros(
+            (self.num_replicas, len(self.sample_weights)),
+            dtype=np.int64,
+        )
+        physical_counts = np.zeros(self.num_replicas, dtype=np.int64)
+
+        # Assign expensive samples first. For each dataset, prefer the rank that has seen the
+        # fewest of its samples, then the lowest total estimated load. This balances unknown
+        # dataset-specific I/O as well as the known tactile-view cost. Video samples cannot
+        # consume slots reserved for a rank's physical-pair floor; otherwise this rebalance
+        # could undo the guarantee established by each virtual-rank sampling plan.
+        indexed = list(enumerate(global_batch))
+        indexed.sort(
+            key=lambda item: (
+                -self.sample_costs[item[1][0]],
+                item[0],
+            )
+        )
+        for original_position, sample in indexed:
+            ds_idx = sample[0]
+            candidates = [
+                rank
+                for rank in range(self.num_replicas)
+                if len(assignments[rank]) < self.batch_size
+            ]
+            is_physical = self.dataset_has_physical[ds_idx]
+            if self.min_physical_per_batch:
+                if is_physical:
+                    deficient = [
+                        rank
+                        for rank in candidates
+                        if physical_counts[rank] < self.min_physical_per_batch
+                    ]
+                    if deficient:
+                        candidates = deficient
+                else:
+                    candidates = [
+                        rank
+                        for rank in candidates
+                        if self.batch_size - len(assignments[rank])
+                        > self.min_physical_per_batch - physical_counts[rank]
+                    ]
+                    if not candidates:
+                        raise RuntimeError(
+                            "Rank balancing exhausted every non-reserved video slot before "
+                            "placing the guaranteed physical samples."
+                        )
+            rank = min(
+                candidates,
+                key=lambda candidate: (
+                    dataset_counts[candidate, ds_idx],
+                    loads[candidate],
+                    len(assignments[candidate]),
+                    candidate,
+                ),
+            )
+            assignments[rank].append((original_position, sample))
+            dataset_counts[rank, ds_idx] += 1
+            loads[rank] += self.sample_costs[ds_idx]
+            physical_counts[rank] += int(is_physical)
+
+        if self.min_physical_per_batch and np.any(
+            physical_counts < self.min_physical_per_batch
+        ):
+            raise RuntimeError(
+                "Rank balancing failed to preserve the physical sample floor: "
+                f"{physical_counts.tolist()}."
+            )
+
+        # Group each local batch by dataset to retain decoder/cache locality. Relative order
+        # within a dataset follows the original global plan.
+        rank_batches = []
+        for assignment in assignments:
+            assignment.sort(key=lambda item: (item[1][0], item[0]))
+            rank_batches.append([sample for _, sample in assignment])
+        return rank_batches
+
+    def __iter__(self):
+        for local_batch_id in range(self.start_batch, self.num_batches):
+            if self.num_replicas == 1 or not self.balance_across_ranks:
+                global_batch_id = local_batch_id * self.num_replicas + self.rank
+                rng = np.random.default_rng(
+                    [self.seed, self.epoch, global_batch_id]
+                )
+                yield self._build_batch(rng)
+                continue
+            global_batch = self._global_batch(local_batch_id)
+            yield self._balanced_rank_batches(global_batch)[self.rank]
+
+
+class FullCoverageBatchSampler(Sampler):
+    """Shuffle every episode-frame anchor once per epoch, padding the final global batch."""
+
+    def __init__(
+        self, episode_ranges: list[np.ndarray], batch_size: int, *,
+        horizon: list[int], sample_weights: np.ndarray,
+        num_replicas: int = 1, rank: int = 0, seed: int | None = 0,
+        dataset_names: list[str] | None = None,
+    ):
+        if batch_size <= 0 or num_replicas <= 0 or not 0 <= rank < num_replicas:
+            raise ValueError("Full-coverage sampling requires a positive batch/world size and a valid rank.")
+        if len(horizon) != len(episode_ranges) or len(sample_weights) != len(episode_ranges):
+            raise ValueError("Episode ranges, horizons and sample weights must describe the same datasets.")
+        weights = np.asarray(sample_weights, dtype=np.float64)
+        if not np.isfinite(weights).all() or (weights < 0).any():
+            raise ValueError("Sample weights must be finite and non-negative.")
+        spans = []
+        for dataset_idx, (ranges, frames, weight) in enumerate(zip(episode_ranges, horizon, weights, strict=True)):
+            ranges = np.asarray(ranges, dtype=np.int64)
+            if ranges.ndim != 2 or ranges.shape[1] != 2 or (ranges < 0).any():
+                raise ValueError("Episode ranges must have shape (N,2) and non-negative indices.")
+            if frames < 0 or (ranges[:, 1] < ranges[:, 0]).any():
+                raise ValueError("Invalid temporal horizon or episode bounds.")
+            if weight <= 0:
+                continue
+            for start, end in ranges:
+                count = int(end) - int(start)
+                if count > 0:
+                    spans.append((dataset_idx, int(start), count))
+        if not spans:
+            raise ValueError("Full-coverage finetuning has no nonempty training episodes.")
+        self.spans = np.asarray(spans, dtype=np.int64)
+        self.anchor_ends = np.cumsum(self.spans[:, 2], dtype=np.int64)
+        self.total_anchors = int(self.anchor_ends[-1])
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = 0 if seed is None else seed
+        self.num_batches = math.ceil(self.total_anchors / (batch_size * num_replicas))
+        self.epoch = 0
+        self.start_batch = 0
+        digest = hashlib.sha256(json.dumps({
+            "format_version": 2,
+            "pad_episode_tail": True,
+            "datasets": dataset_names, "horizons": [int(value) for value in horizon],
+            "batch_size": batch_size, "world_size": num_replicas, "seed": self.seed,
+        }, sort_keys=True).encode())
+        digest.update(self.spans.tobytes())
+        self.fingerprint = digest.hexdigest()
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        self.start_batch = 0
+
+    def set_start_batch(self, start_batch: int) -> None:
+        if not 0 <= start_batch <= self.num_batches:
+            raise ValueError(f"start_batch must be in [0, {self.num_batches}].")
+        self.start_batch = start_batch
+
+    def __len__(self) -> int:
+        return self.num_batches - self.start_batch
+
+    def __iter__(self):
+        order = np.random.default_rng([self.seed, self.epoch]).permutation(self.total_anchors)
+        for batch in range(self.start_batch, self.num_batches):
+            positions = (
+                batch * self.batch_size * self.num_replicas
+                + self.rank * self.batch_size + np.arange(self.batch_size)
+            ) % self.total_anchors
+            anchors = order[positions]
+            rows = np.searchsorted(self.anchor_ends, anchors, side="right")
+            previous = np.where(rows > 0, self.anchor_ends[np.maximum(rows - 1, 0)], 0)
+            yield [
+                (int(self.spans[row, 0]), int(self.spans[row, 1] + anchor - offset))
+                for row, anchor, offset in zip(rows, anchors, previous, strict=True)
+            ]

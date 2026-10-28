@@ -1,0 +1,176 @@
+[project.urls]
+homepage = "https://github.com/huggingface/lerobot"
+issues = "https://github.com/huggingface/lerobot/issues"
+discord = "https://discord.gg/s3KuuzsPFb"
+
+[project]
+name = "lerobot"
+version = "0.1.0"
+description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
+authors = [
+    {name = "Rémi Cadène", email = "re.cadene@gmail.com"},
+    {name = "Simon Alibert", email = "alibert.sim@gmail.com"},
+    {name = "Alexander Soare", email = "alexander.soare159@gmail.com"},
+    {name = "Quentin Gallouédec", email = "quentin.gallouedec@ec-lyon.fr"},
+    {name = "Adil Zouitine", email = "adilzouitinegm@gmail.com"},
+    {name = "Thomas Wolf", email = "thomaswolfcontact@gmail.com"},
+]
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+keywords = ["robotics", "deep learning", "pytorch"]
+classifiers=[
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "cmake>=3.29.0.1",
+    # 4.0 把 `Sequence` 特征改名成 `List`，两边互不认：4.x 写出的 parquet 在 <4.0 下会以
+    # `TypeError: must be called with a dataclass type or instance` 炸掉（OpenNeo 的数据就是
+    # 这么写的，datasets_v30/io_utils.py 里的 _register_list_feature_alias 是单向补丁，只能让
+    # 3.x 读 4.x 的数据，反过来不行）。整个仓库的 v2.1 / v3.0 加载路径都建立在 3.x 上。
+    "datasets>=3.0.0,<4.0.0",
+    "deepdiff>=7.0.1",
+    "diffusers>=0.27.2",
+    "draccus==0.10.0",
+    "einops>=0.8.0",
+    "flask>=3.0.3",
+    "gdown>=5.1.0",
+    "gymnasium==0.29.1", # TODO(rcadene, aliberts): Make gym 1.0.0 work
+    "h5py>=3.10.0",
+    "huggingface-hub[hf-transfer,cli]>=0.27.1 ; python_version < '4.0'",
+    "hydra-core>=1.3.2",
+    "imageio[ffmpeg]>=2.34.0",
+    "jsonlines>=4.0.0",
+    "numba>=0.59.0",
+    "omegaconf>=2.3.0",
+    "opencv-python-headless>=4.9.0",
+    "packaging>=24.2",
+    "av>=12.0.5",
+    "pymunk>=6.6.0",
+    "pynput>=1.7.7",
+    "pyzmq>=26.2.1",
+    "rerun-sdk>=0.21.0",
+    # 数据集模块在 import 期就用它打印统计表（contrastive_dataset.py、lerobot_dataset.py 等）
+    "tabulate>=0.9.0",
+    "termcolor>=2.4.0",
+    "torch>=2.2.1",
+    # video_utils.py 会优先选 torchcodec 作为解码后端，训练脚本也显式传 --dataset.video_backend
+    "torchcodec>=0.2.0",
+    "torchvision>=0.21.0",
+    "wandb>=0.16.3",
+    "zarr>=2.17.0",
+]
+
+[project.optional-dependencies]
+aloha = ["gym-aloha>=0.1.1 ; python_version < '4.0'"]
+dev = ["pre-commit>=3.7.0", "debugpy>=1.8.1"]
+dora = ["gym-dora @ git+https://github.com/dora-rs/dora-lerobot.git#subdirectory=gym_dora ; python_version < '4.0'"]
+dynamixel = ["dynamixel-sdk>=3.7.31", "pynput>=1.7.7"]
+feetech = ["feetech-servo-sdk>=1.0.0", "pynput>=1.7.7"]
+intelrealsense = ["pyrealsense2>=2.55.1.6486 ; sys_platform != 'darwin'"]
+# 感知<->物理对比预训练（robo_contrast，train_ace.sh / train_ace_local.sh）需要的额外依赖。
+# 为了让现有的 `pip install -e ".[pi0]"` 一条命令仍然够用，pi0 里也带上了同样的约束。
+contrast = [
+    # Qwen3-VL stage two uses the 4.57 multimodal/MRoPE API. Transformers 5 changed this
+    # interface, so keep the supported range explicit instead of silently random-loading.
+    "transformers>=4.57.0,<5.0",
+    # Frozen vision towers use parameter-efficient attention adapters for alignment.
+    "peft>=0.18.0,<0.19.0",
+    # 训练脚本 dps_train_contrast.py 直接 import deepspeed，两个启动脚本也都走 deepspeed/ZeRO-2
+    "deepspeed>=0.14.0",
+    # Stage-two FSDP uses quantized AdamW optimizer states.
+    "bitsandbytes>=0.48.0,<0.51.0",
+    # 0.15 is exact for torch 2.9.1. The torch 2.7 cluster path skips its C++ extensions
+    # and feature-probes the Python FP8 wrappers against torch's native _scaled_mm.
+    "torchao>=0.15.0,<0.16.0",
+    # tactile_backbone="ftp1" 时用它读 hpt_tokenizer/*.safetensors
+    "safetensors>=0.4.0",
+]
+pi0 = [
+    "transformers>=4.57.0,<5.0",
+    "peft>=0.18.0,<0.19.0",
+    "deepspeed>=0.14.0",
+    "bitsandbytes>=0.48.0,<0.51.0",
+    "torchao>=0.15.0,<0.16.0",
+    "safetensors>=0.4.0",
+]
+pusht = ["gym-pusht>=0.1.5 ; python_version < '4.0'"]
+stretch = [
+    "hello-robot-stretch-body>=0.7.27 ; python_version < '4.0' and sys_platform == 'linux'",
+    "pyrender @ git+https://github.com/mmatl/pyrender.git ; sys_platform == 'linux'",
+    "pyrealsense2>=2.55.1.6486 ; sys_platform != 'darwin'",
+    "pynput>=1.7.7"
+]
+test = ["pytest>=8.1.0", "pytest-cov>=5.0.0", "pyserial>=3.5"]
+umi = ["imagecodecs>=2024.1.1"]
+video_benchmark = ["scikit-image>=0.23.2", "pandas>=2.2.2"]
+xarm = ["gym-xarm>=0.1.1 ; python_version < '4.0'"]
+
+[tool.poetry]
+requires-poetry = ">=2.1"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = [
+    "tests/data",
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "N", "B", "C4", "SIM"]
+
+[tool.bandit]
+exclude_dirs = [
+    "tests",
+    "benchmarks",
+    "lerobot/common/datasets/push_dataset_to_hub",
+    "lerobot/common/datasets/v2/convert_dataset_v1_to_v2",
+    "lerobot/common/policies/pi0/conversion_scripts",
+    "lerobot/scripts/push_dataset_to_hub.py",
+]
+skips = ["B101", "B311", "B404", "B603"]
+
+[tool.typos]
+default.extend-ignore-re = [
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",  # spellchecker:disable-line
+    "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on"  # spellchecker:<on|off>
+]
+default.extend-ignore-identifiers-re = [
+    # Add individual words here to ignore them
+    "2nd",
+    "pn",
+    "ser",
+    "ein",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

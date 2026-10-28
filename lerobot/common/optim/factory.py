@@ -1,0 +1,67 @@
+#!/usr/bin/env python
+
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.configs.train import TrainPipelineConfig
+
+
+def make_optimizer_and_scheduler(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    num_training_steps: int | None = None,
+) -> tuple[Optimizer, LRScheduler | None]:
+    """Generates the optimizer and scheduler based on configs.
+
+    Args:
+        cfg (TrainPipelineConfig): The training config that contains optimizer and scheduler configs
+        policy (PreTrainedPolicy): The policy config from which parameters and presets must be taken from.
+        num_training_steps: Optional scheduler length override. Defaults to ``cfg.steps``.
+
+    Returns:
+        tuple[Optimizer, LRScheduler | None]: The couple (Optimizer, Scheduler). Scheduler can be `None`.
+    """
+    
+    # for name, params in policy.named_parameters():
+    #     if "scale_shift_table" in name:
+    #         print(name)
+    
+    params = policy.get_optim_params() if cfg.use_policy_training_preset else policy.parameters()
+    params = list(params)
+    if params and isinstance(params[0], dict):
+        # `get_optim_params` may return parameter *groups* (e.g. to give a backbone its own
+        # learning rate), in which case the frozen-parameter filter applies inside each group.
+        groups = []
+        for group in params:
+            group = dict(group)
+            group["params"] = [p for p in group["params"] if p.requires_grad]
+            if group["params"]:
+                groups.append(group)
+        params = groups
+    else:
+        params = [p for p in params if p.requires_grad]
+    optimizer = cfg.optimizer.build(params)
+    if num_training_steps is None:
+        num_training_steps = cfg.steps
+    lr_scheduler = (
+        cfg.scheduler.build(optimizer, num_training_steps)
+        if cfg.scheduler is not None
+        else None
+    )
+    return optimizer, lr_scheduler
